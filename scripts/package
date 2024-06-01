@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+
+./package_lvmplugin
+./package_lvm_provisioner

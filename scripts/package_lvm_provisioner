@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+source $(dirname $0)/version
+
+cd $(dirname $0)/..
+
+IMAGE=${REPO}/harvester-lvm-provisioner:${TAG}
+DOCKERFILE=package/Dockerfile.provisioner
+if [ -e ${DOCKERFILE}.${ARCH} ]; then
+    DOCKERFILE=${DOCKERFILE}.${ARCH}
+fi
+
+buildx build --load -f ${DOCKERFILE} -t ${IMAGE} .
+echo Built ${IMAGE}

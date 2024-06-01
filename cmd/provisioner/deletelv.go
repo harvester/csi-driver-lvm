@@ -3,9 +3,10 @@ package main
 import (
 	"fmt"
 
-	"github.com/metal-stack/csi-driver-lvm/pkg/lvm"
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog/v2"
+
+	"github.com/harvester/csi-driver-lvm/pkg/lvm"
 )
 
 func deleteLVCmd() *cli.Command {
