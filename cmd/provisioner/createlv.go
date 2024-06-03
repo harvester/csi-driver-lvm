@@ -77,5 +77,6 @@ func createLV(c *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("unable to create lv: %w output:%s", err, output)
 	}
+	klog.Infof("lv: %s created, vg:%s size:%d type:%s", lvName, vgName, lvSize, lvmType)
 	return nil
 }
