@@ -13,5 +13,7 @@ fi
 LINKFLAGS="-X github.com/hravester/csi-driver-lvm/pkg/version.Version=$VERSION
            -X github.com/harvester/csi-driver-lvm/pkg/version.GitCommit=$COMMIT $LINKFLAGS"
 
-CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/lvmplugin
-CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-lvmplugin-provisioner cmd/provisioner/*.go
+for arch in "amd64" "arm64"; do
+    GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/lvmplugin-"$arch"
+    GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-lvmplugin-provisioner-"$arch" cmd/provisioner/*.go
+done
