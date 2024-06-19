@@ -29,13 +29,11 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
 	v1 "k8s.io/api/core/v1"
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
 	"k8s.io/klog/v2"
 )
 
@@ -249,7 +247,7 @@ func umountLV(targetPath string) {
 	cmd := exec.Command("umount", "--lazy", "--force", targetPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		klog.Errorf("unable to umount %s output:%s err:%w", targetPath, string(out), err)
+		klog.Errorf("unable to umount %s output:%s err:%v", targetPath, string(out), err)
 	}
 }
 
@@ -271,7 +269,8 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 	args = append(args, "--lvname", va.name, "--vgname", va.vgName)
 
 	klog.Infof("start provisionerPod with args:%s", args)
-	hostPathType := v1.HostPathDirectoryOrCreate
+	hostPathTypeDirOrCreate := v1.HostPathDirectoryOrCreate
+	hostPathTypeDirectory := v1.HostPathDirectory
 	privileged := true
 	mountPropagationBidirectional := v1.MountPropagationBidirectional
 	provisionerPod := &v1.Pod{
@@ -322,6 +321,16 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 							MountPath:        "/run/lock/lvm",
 							MountPropagation: &mountPropagationBidirectional,
 						},
+						{
+							Name:      "host-lvm-conf",
+							ReadOnly:  true,
+							MountPath: "/etc/lvm/lvm.conf",
+						},
+						{
+							Name:      "host-run-udev",
+							ReadOnly:  true,
+							MountPath: "/run/udev",
+						},
 					},
 					TerminationMessagePath: "/termination.log",
 					ImagePullPolicy:        va.pullPolicy,
@@ -346,7 +355,7 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 					VolumeSource: v1.VolumeSource{
 						HostPath: &v1.HostPathVolumeSource{
 							Path: "/dev",
-							Type: &hostPathType,
+							Type: &hostPathTypeDirOrCreate,
 						},
 					},
 				},
@@ -355,7 +364,7 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 					VolumeSource: v1.VolumeSource{
 						HostPath: &v1.HostPathVolumeSource{
 							Path: "/lib/modules",
-							Type: &hostPathType,
+							Type: &hostPathTypeDirOrCreate,
 						},
 					},
 				},
@@ -364,7 +373,7 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 					VolumeSource: v1.VolumeSource{
 						HostPath: &v1.HostPathVolumeSource{
 							Path: filepath.Join(va.hostWritePath, "backup"),
-							Type: &hostPathType,
+							Type: &hostPathTypeDirOrCreate,
 						},
 					},
 				},
@@ -373,7 +382,7 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 					VolumeSource: v1.VolumeSource{
 						HostPath: &v1.HostPathVolumeSource{
 							Path: filepath.Join(va.hostWritePath, "cache"),
-							Type: &hostPathType,
+							Type: &hostPathTypeDirOrCreate,
 						},
 					},
 				},
@@ -382,7 +391,24 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 					VolumeSource: v1.VolumeSource{
 						HostPath: &v1.HostPathVolumeSource{
 							Path: filepath.Join(va.hostWritePath, "lock"),
-							Type: &hostPathType,
+							Type: &hostPathTypeDirOrCreate,
+						},
+					},
+				},
+				{
+					Name: "host-lvm-conf",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/etc/lvm/lvm.conf",
+						},
+					},
+				},
+				{
+					Name: "host-run-udev",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/run/udev",
+							Type: &hostPathTypeDirectory,
 						},
 					},
 				},
@@ -496,7 +522,7 @@ func CreateVG(name string, devicesPattern string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unable to lookup devices from devicesPattern %s, err:%w", devicesPattern, err)
 	}
-	tags := []string{"vg.metal-stack.io/csi-lvm-driver"}
+	tags := []string{"harvester-csi-lvm"}
 
 	args := []string{"-v", name}
 	args = append(args, physicalVolumes...)
@@ -550,7 +576,7 @@ func CreateLVS(vg string, name string, size uint64, lvmType string) (string, err
 		return "", fmt.Errorf("unsupported lvmtype: %s", lvmType)
 	}
 
-	tags := []string{"lv.metal-stack.io/csi-lvm-driver"}
+	tags := []string{"harvester-csi-lvm"}
 	for _, tag := range tags {
 		args = append(args, "--addtag", tag)
 	}
