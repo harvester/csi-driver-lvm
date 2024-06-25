@@ -6,13 +6,13 @@ pluginImage:
   repository: rancher/harvester-lvm-csi-plugin
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "master-head"
+  tag: "main-head"
 
 provisionerImage:
   repository: rancher/harvester-lvm-provisioner
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "master-head"
+  tag: "main-head"
 
 lvm:
   # This one you should change
@@ -23,9 +23,7 @@ lvm:
   hostWritePath: /etc/lvm
 
   # these are primariliy for testing purposes
-  #vgName: csi-lvm
   driverName: lvm.driver.harvesterhci.io
-  #storageClassStub: csi-driver-lvm
 
 rbac:
   create: true
