@@ -17,18 +17,16 @@ limitations under the License.
 package lvm
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 
-	"context"
-
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/docker/go-units"
 	"golang.org/x/sys/unix"
-
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -82,7 +80,9 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 
+	volAttrs := req.GetVolumeContext()
 	targetPath := req.GetTargetPath()
+	vgName := volAttrs["vgName"]
 
 	if req.GetVolumeCapability().GetBlock() != nil &&
 		req.GetVolumeCapability().GetMount() != nil {
@@ -117,12 +117,12 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 		volID := req.GetVolumeId()
 
-		output, err := CreateVG(ns.vgName, ns.devicesPattern)
+		output, err := CreateVG(vgName, ns.devicesPattern)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create vg: %w output:%s", err, output)
 		}
 
-		output, err = CreateLVS(ns.vgName, volID, size, req.GetVolumeContext()["type"])
+		output, err = CreateLVS(vgName, volID, size, req.GetVolumeContext()["type"])
 		if err != nil {
 			return nil, fmt.Errorf("unable to create lv: %w output:%s", err, output)
 		}
@@ -132,21 +132,21 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	if req.GetVolumeCapability().GetBlock() != nil {
 
-		output, err := bindMountLV(req.GetVolumeId(), targetPath, ns.vgName)
+		output, err := bindMountLV(req.GetVolumeId(), targetPath, vgName)
 		if err != nil {
 			return nil, fmt.Errorf("unable to bind mount lv: %w output:%s", err, output)
 		}
 		// FIXME: VolumeCapability is a struct and not the size
-		klog.Infof("block lv %s size:%s vg:%s devices:%s created at:%s", req.GetVolumeId(), req.GetVolumeCapability(), ns.vgName, ns.devicesPattern, targetPath)
+		klog.Infof("block lv %s size:%s vg:%s devices:%s created at:%s", req.GetVolumeId(), req.GetVolumeCapability(), vgName, ns.devicesPattern, targetPath)
 
 	} else if req.GetVolumeCapability().GetMount() != nil {
 
-		output, err := mountLV(req.GetVolumeId(), targetPath, ns.vgName, req.GetVolumeCapability().GetMount().GetFsType())
+		output, err := mountLV(req.GetVolumeId(), targetPath, vgName, req.GetVolumeCapability().GetMount().GetFsType())
 		if err != nil {
 			return nil, fmt.Errorf("unable to mount lv: %w output:%s", err, output)
 		}
 		// FIXME: VolumeCapability is a struct and not the size
-		klog.Infof("mounted lv %s size:%s vg:%s devices:%s created at:%s", req.GetVolumeId(), req.GetVolumeCapability(), ns.vgName, ns.devicesPattern, targetPath)
+		klog.Infof("mounted lv %s size:%s vg:%s devices:%s created at:%s", req.GetVolumeId(), req.GetVolumeCapability(), vgName, ns.devicesPattern, targetPath)
 
 	}
 
@@ -173,11 +173,11 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	// ephemeral volumes start with "csi-"
 	if strings.HasPrefix(volID, "csi-") {
 		// remove ephemeral volume here
-		output, err := RemoveLVS(ns.vgName, volID)
+		output, err := RemoveLVS(volID)
 		if err != nil {
 			return nil, fmt.Errorf("unable to delete lv: %w output:%s", err, output)
 		}
-		klog.Infof("lv %s vg:%s deleted", volID, ns.vgName)
+		klog.Infof("lv %s deleted", volID)
 
 	}
 

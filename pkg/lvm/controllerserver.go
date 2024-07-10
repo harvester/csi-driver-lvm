@@ -115,6 +115,11 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Errorf(codes.Internal, "lvmType is incorrect: %s", lvmType)
 	}
 
+	vgName := req.GetParameters()["vgName"]
+	if vgName == "" {
+		return nil, status.Error(codes.InvalidArgument, "vgName is missing, please check the storage class")
+	}
+
 	volumeContext := req.GetParameters()
 	size := strconv.FormatInt(req.GetCapacityRange().GetRequiredBytes(), 10)
 
@@ -138,7 +143,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		provisionerImage: cs.provisionerImage,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
-		vgName:           cs.vgName,
+		vgName:           vgName,
 		hostWritePath:    cs.hostWritePath,
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {
