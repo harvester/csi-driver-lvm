@@ -20,16 +20,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"strconv"
-	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/docker/go-units"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 )
 
@@ -37,33 +32,17 @@ const topologyKeyNode = "topology.lvm.csi/node"
 
 type nodeServer struct {
 	nodeID            string
-	ephemeral         bool
 	maxVolumesPerNode int64
 	devicesPattern    string
-	vgName            string
 }
 
-func newNodeServer(nodeID string, ephemeral bool, maxVolumesPerNode int64, devicesPattern string, vgName string) *nodeServer {
+func newNodeServer(nodeID string, maxVolumesPerNode int64) *nodeServer {
 
-	// revive existing volumes at start of node server
-	vgexists := vgExists(vgName)
-	if !vgexists {
-		klog.Infof("volumegroup: %s not found\n", vgName)
-		vgActivate()
-		// now check again for existing vg again
-	}
-	cmd := exec.Command("lvchange", "-ay", vgName)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Infof("unable to activate logical volumes:%s %v", out, err)
-	}
+	VgActivate()
 
 	return &nodeServer{
 		nodeID:            nodeID,
-		ephemeral:         ephemeral,
 		maxVolumesPerNode: maxVolumesPerNode,
-		devicesPattern:    devicesPattern,
-		vgName:            vgName,
 	}
 }
 
@@ -104,32 +83,6 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "cannot have both block and mount access type")
 	}
 
-	ephemeralVolume := req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "true" ||
-		req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "" && ns.ephemeral // Kubernetes 1.15 doesn't have csi.storage.k8s.io/ephemeral.
-
-	// if ephemeral is specified, create volume here
-	if ephemeralVolume {
-
-		size, err := parseSize(req.GetVolumeContext()["size"])
-		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
-		}
-
-		volID := req.GetVolumeId()
-
-		output, err := CreateVG(vgName, ns.devicesPattern)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create vg: %w output:%s", err, output)
-		}
-
-		output, err = CreateLVS(vgName, volID, size, req.GetVolumeContext()["type"])
-		if err != nil {
-			return nil, fmt.Errorf("unable to create lv: %w output:%s", err, output)
-		}
-
-		klog.V(4).Infof("ephemeral mode: created volume: %s, size: %d", volID, size)
-	}
-
 	if req.GetVolumeCapability().GetBlock() != nil {
 
 		output, err := bindMountLV(req.GetVolumeId(), targetPath, vgName)
@@ -155,8 +108,6 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 
-	// TODO
-	// implement deletion of ephemeral volumes
 	volID := req.GetVolumeId()
 
 	klog.Infof("NodeUnpublishRequest: %s", req)
@@ -169,17 +120,6 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 
 	umountLV(req.GetTargetPath())
-
-	// ephemeral volumes start with "csi-"
-	if strings.HasPrefix(volID, "csi-") {
-		// remove ephemeral volume here
-		output, err := RemoveLVS(volID)
-		if err != nil {
-			return nil, fmt.Errorf("unable to delete lv: %w output:%s", err, output)
-		}
-		klog.Infof("lv %s deleted", volID)
-
-	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -317,7 +257,7 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		isBlock = true
 	}
 
-	output, err := extendLVS(ns.vgName, volID, uint64(capacity), isBlock)
+	output, err := extendLVS(volID, uint64(capacity), isBlock)
 
 	if err != nil {
 		return nil, fmt.Errorf("unable to umount lv: %w output:%s", err, output)
@@ -328,40 +268,4 @@ func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		CapacityBytes: capacity,
 	}, nil
 
-}
-
-func parseSize(val string) (uint64, error) {
-	if val == "" {
-		return 0, fmt.Errorf("ephemeral inline volume is missing size parameter")
-	}
-
-	parseWithKubernetes := func(raw string) (uint64, error) {
-		sizeQuantity, err := resource.ParseQuantity(raw)
-		if err != nil {
-			return 0, fmt.Errorf("failed to parse size (%s) of ephemeral inline volume: %w", raw, err)
-		}
-
-		size, err := strconv.ParseUint(sizeQuantity.AsDec().String(), 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("parsed volume size (%s) of ephemeral inline volume does not fit into an uint64: %w", raw, err)
-		}
-
-		return size, nil
-	}
-
-	// this was the initial method to parse the size and has to be kept for compatibility reasons
-	parseWithGoUnits := func(raw string) (uint64, error) {
-		size, err := units.RAMInBytes(raw)
-		if err != nil {
-			return 0, fmt.Errorf("failed to parse size (%s) of ephemeral inline volume: %w", raw, err)
-		}
-
-		return uint64(size), nil
-	}
-
-	if size, err := parseWithKubernetes(val); err == nil {
-		return size, nil
-	}
-
-	return parseWithGoUnits(val)
 }

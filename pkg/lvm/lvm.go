@@ -44,10 +44,7 @@ type Lvm struct {
 	version           string
 	endpoint          string
 	hostWritePath     string
-	ephemeral         bool
 	maxVolumesPerNode int64
-	devicesPattern    string
-	vgName            string
 	provisionerImage  string
 	pullPolicy        v1.PullPolicy
 	namespace         string
@@ -69,7 +66,6 @@ type volumeAction struct {
 	nodeName         string
 	size             int64
 	lvmType          string
-	devicesPattern   string
 	provisionerImage string
 	pullPolicy       v1.PullPolicy
 	kubeClient       kubernetes.Clientset
@@ -93,7 +89,7 @@ var (
 )
 
 // NewLvmDriver creates the driver
-func NewLvmDriver(driverName, nodeID, endpoint string, hostWritePath string, ephemeral bool, maxVolumesPerNode int64, version string, devicesPattern string, vgName string, namespace string, provisionerImage string, pullPolicy string) (*Lvm, error) {
+func NewLvmDriver(driverName, nodeID, endpoint string, hostWritePath string, maxVolumesPerNode int64, version string, namespace string, provisionerImage string, pullPolicy string) (*Lvm, error) {
 	if driverName == "" {
 		return nil, fmt.Errorf("no driver name provided")
 	}
@@ -124,10 +120,7 @@ func NewLvmDriver(driverName, nodeID, endpoint string, hostWritePath string, eph
 		nodeID:            nodeID,
 		endpoint:          endpoint,
 		hostWritePath:     hostWritePath,
-		ephemeral:         ephemeral,
 		maxVolumesPerNode: maxVolumesPerNode,
-		devicesPattern:    devicesPattern,
-		vgName:            vgName,
 		namespace:         namespace,
 		provisionerImage:  provisionerImage,
 		pullPolicy:        pp,
@@ -139,8 +132,8 @@ func (lvm *Lvm) Run() error {
 	var err error
 	// Create GRPC servers
 	lvm.ids = newIdentityServer(lvm.name, lvm.version)
-	lvm.ns = newNodeServer(lvm.nodeID, lvm.ephemeral, lvm.maxVolumesPerNode, lvm.devicesPattern, lvm.vgName)
-	lvm.cs, err = newControllerServer(lvm.ephemeral, lvm.nodeID, lvm.devicesPattern, lvm.vgName, lvm.hostWritePath, lvm.namespace, lvm.provisionerImage, lvm.pullPolicy)
+	lvm.ns = newNodeServer(lvm.nodeID, lvm.maxVolumesPerNode)
+	lvm.cs, err = newControllerServer(lvm.nodeID, lvm.hostWritePath, lvm.namespace, lvm.provisionerImage, lvm.pullPolicy)
 	if err != nil {
 		return err
 	}
@@ -267,12 +260,12 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 
 	args := []string{}
 	if va.action == actionTypeCreate {
-		args = append(args, "createlv", "--lvsize", fmt.Sprintf("%d", va.size), "--devices", va.devicesPattern, "--lvmtype", va.lvmType)
+		args = append(args, "createlv", "--lvsize", fmt.Sprintf("%d", va.size), "--lvmtype", va.lvmType, "--vgname", va.vgName)
 	}
 	if va.action == actionTypeDelete {
 		args = append(args, "deletelv")
 	}
-	args = append(args, "--lvname", va.name, "--vgname", va.vgName)
+	args = append(args, "--lvname", va.name)
 
 	klog.Infof("start provisionerPod with args:%s", args)
 	hostPathTypeDirOrCreate := v1.HostPathDirectoryOrCreate
@@ -466,7 +459,7 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 }
 
 // VgExists checks if the given volume group exists
-func vgExists(vgname string) bool {
+func VgExists(vgname string) bool {
 	executor := cmd.NewExecutor()
 	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "vg_name"})
 	if err != nil {
@@ -477,7 +470,7 @@ func vgExists(vgname string) bool {
 }
 
 // VgActivate execute vgchange -ay to activate all volumes of the volume group
-func vgActivate() {
+func VgActivate() {
 	executor := cmd.NewExecutor()
 	// scan for vgs and activate if any
 	out, err := executor.Execute("vgscan", []string{})
@@ -490,59 +483,7 @@ func vgActivate() {
 	}
 }
 
-func devices(devicesPattern []string) (devices []string, err error) {
-	for _, devicePattern := range devicesPattern {
-		klog.Infof("search devices: %s ", devicePattern)
-		matches, err := filepath.Glob(strings.TrimSpace(devicePattern))
-		if err != nil {
-			return nil, err
-		}
-		klog.Infof("found: %s", matches)
-		devices = append(devices, matches...)
-	}
-	return devices, nil
-}
-
-// CreateVG creates a volume group matching the given device patterns
-func CreateVG(name string, devicesPattern string) (string, error) {
-	dp := strings.Split(devicesPattern, ",")
-	if len(dp) == 0 {
-		return name, fmt.Errorf("invalid empty flag %v", dp)
-	}
-
-	vgexists := vgExists(name)
-	if vgexists {
-		klog.Infof("volumegroup: %s already exists\n", name)
-		return name, nil
-	}
-	vgActivate()
-	// now check again for existing vg again
-	vgexists = vgExists(name)
-	if vgexists {
-		klog.Infof("volumegroup: %s already exists\n", name)
-		return name, nil
-	}
-
-	physicalVolumes, err := devices(dp)
-	if err != nil {
-		return "", fmt.Errorf("unable to lookup devices from devicesPattern %s, err:%w", devicesPattern, err)
-	}
-
-	executor := cmd.NewExecutor()
-	tags := []string{"harvester-csi-lvm"}
-
-	args := []string{"-v", name}
-	args = append(args, physicalVolumes...)
-	for _, tag := range tags {
-		args = append(args, "--addtag", tag)
-	}
-	klog.Infof("create vg with command: vgcreate %v", args)
-	out, err := executor.Execute("vgcreate", args)
-	return out, err
-}
-
-// CreateLVS creates the new volume
-// used by lvcreate provisioner pod and by nodeserver for ephemeral volumes
+// CreateLVS creates the new volume, used by lvcreate provisioner pod
 func CreateLVS(vg string, name string, size uint64, lvmType string) (string, error) {
 
 	if lvExists(vg, name) {
@@ -604,8 +545,12 @@ func lvExists(vg string, name string) bool {
 	return name == strings.TrimSpace(out)
 }
 
-func extendLVS(vg string, name string, size uint64, isBlock bool) (string, error) {
-	if !lvExists(vg, name) {
+func extendLVS(name string, size uint64, isBlock bool) (string, error) {
+	vgName, err := getRelatedVG(name)
+	if err != nil {
+		return "", fmt.Errorf("unable to get related vg for lv %s: %w", name, err)
+	}
+	if !lvExists(vgName, name) {
 		return "", fmt.Errorf("logical volume %s does not exist", name)
 	}
 
@@ -618,7 +563,7 @@ func extendLVS(vg string, name string, size uint64, isBlock bool) (string, error
 	} else {
 		args = append(args, "-r")
 	}
-	args = append(args, fmt.Sprintf("%s/%s", vg, name))
+	args = append(args, fmt.Sprintf("%s/%s", vgName, name))
 	klog.Infof("lvextend %s", args)
 	out, err := executor.Execute("lvextend", args)
 	return out, err
@@ -626,6 +571,37 @@ func extendLVS(vg string, name string, size uint64, isBlock bool) (string, error
 
 // RemoveLVS executes lvremove
 func RemoveLVS(name string) (string, error) {
+	vgName, err := getRelatedVG(name)
+	if err != nil {
+		return "", fmt.Errorf("unable to get related vg for lv %s: %w", name, err)
+	}
+	if !lvExists(vgName, name) {
+		return fmt.Sprintf("logical volume %s does not exist. Assuming it has already been deleted.", name), nil
+	}
+
+	executor := cmd.NewExecutor()
+	args := []string{"-q", "-y"}
+	args = append(args, fmt.Sprintf("%s/%s", vgName, name))
+	klog.Infof("lvremove %s", args)
+	out, err := executor.Execute("lvremove", args)
+	return out, err
+}
+
+func pvCount(vgname string) (int, error) {
+	executor := cmd.NewExecutor()
+	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "pv_count"})
+	if err != nil {
+		return 0, err
+	}
+	outStr := strings.TrimSpace(out)
+	count, err := strconv.Atoi(outStr)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func getRelatedVG(lvname string) (string, error) {
 	executor := cmd.NewExecutor()
 	// we would like to get the lvname, vgname as below:
 	// pvc-2e08db0f-01d0-462a-9da7-7da06fefd206 vg01
@@ -648,32 +624,10 @@ func RemoveLVS(name string) (string, error) {
 		lvVgPairs[parts[0]] = parts[1]
 	}
 
-	if _, ok := lvVgPairs[name]; !ok {
-		return "", fmt.Errorf("logical volume %s does not exist", name)
+	if _, ok := lvVgPairs[lvname]; !ok {
+		return "", fmt.Errorf("logical volume %s does not exist", lvname)
 	}
-	targetVgName := lvVgPairs[name]
+	relatedVgName := lvVgPairs[lvname]
 
-	if !lvExists(targetVgName, name) {
-		return fmt.Sprintf("logical volume %s does not exist. Assuming it has already been deleted.", name), nil
-	}
-
-	args := []string{"-q", "-y"}
-	args = append(args, fmt.Sprintf("%s/%s", targetVgName, name))
-	klog.Infof("lvremove %s", args)
-	out, err = executor.Execute("lvremove", args)
-	return out, err
-}
-
-func pvCount(vgname string) (int, error) {
-	executor := cmd.NewExecutor()
-	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "pv_count"})
-	if err != nil {
-		return 0, err
-	}
-	outStr := strings.TrimSpace(out)
-	count, err := strconv.Atoi(outStr)
-	if err != nil {
-		return 0, err
-	}
-	return count, nil
+	return relatedVgName, nil
 }

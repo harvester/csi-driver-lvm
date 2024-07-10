@@ -34,8 +34,6 @@ import (
 type controllerServer struct {
 	caps             []*csi.ControllerServiceCapability
 	nodeID           string
-	devicesPattern   string
-	vgName           string
 	hostWritePath    string
 	kubeClient       kubernetes.Clientset
 	provisionerImage string
@@ -44,11 +42,7 @@ type controllerServer struct {
 }
 
 // NewControllerServer
-func newControllerServer(ephemeral bool, nodeID string, devicesPattern string, vgName string, hostWritePath string, namespace string, provisionerImage string, pullPolicy v1.PullPolicy) (*controllerServer, error) {
-	if ephemeral {
-		return &controllerServer{caps: getControllerServiceCapabilities(nil), nodeID: nodeID}, nil
-	}
-
+func newControllerServer(nodeID string, hostWritePath string, namespace string, provisionerImage string, pullPolicy v1.PullPolicy) (*controllerServer, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, err
@@ -69,9 +63,7 @@ func newControllerServer(ephemeral bool, nodeID string, devicesPattern string, v
 				//				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			}),
 		nodeID:           nodeID,
-		devicesPattern:   devicesPattern,
 		hostWritePath:    hostWritePath,
-		vgName:           vgName,
 		kubeClient:       *kubeClient,
 		namespace:        namespace,
 		provisionerImage: provisionerImage,
@@ -138,7 +130,6 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		nodeName:         node,
 		size:             req.GetCapacityRange().GetRequiredBytes(),
 		lvmType:          lvmType,
-		devicesPattern:   cs.devicesPattern,
 		pullPolicy:       cs.pullPolicy,
 		provisionerImage: cs.provisionerImage,
 		kubeClient:       cs.kubeClient,
@@ -204,7 +195,6 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		provisionerImage: cs.provisionerImage,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
-		vgName:           "", // Deprecated. delete does not need vgName
 		hostWritePath:    cs.hostWritePath,
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {

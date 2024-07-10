@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog/v2"
@@ -28,10 +29,6 @@ func createLVCmd() *cli.Command {
 			&cli.StringFlag{
 				Name:  flagLVMType,
 				Usage: "Required. type of lvs, can be either striped or mirrored",
-			},
-			&cli.StringFlag{
-				Name:  flagDevicesPattern,
-				Usage: "Required. comma-separated grok patterns of the physical volumes to use.",
 			},
 		},
 		Action: func(c *cli.Context) error {
@@ -61,19 +58,18 @@ func createLV(c *cli.Context) error {
 	if lvmType == "" {
 		return fmt.Errorf("invalid empty flag %v", flagLVMType)
 	}
-	devicesPattern := c.String(flagDevicesPattern)
-	if devicesPattern == "" {
-		return fmt.Errorf("invalid empty flag %v", flagDevicesPattern)
+
+	klog.Infof("create lv %s size:%d vg:%s type:%s", lvName, lvSize, vgName, lvmType)
+
+	if !lvm.VgExists(vgName) {
+		lvm.VgActivate()
+		time.Sleep(1 * time.Second) // jitter
+		if !lvm.VgExists(vgName) {
+			return fmt.Errorf("vg %s does not exist, please check the corresponding VG is created", vgName)
+		}
 	}
 
-	klog.Infof("create lv %s size:%d vg:%s devicespattern:%s  type:%s", lvName, lvSize, vgName, devicesPattern, lvmType)
-
-	output, err := lvm.CreateVG(vgName, devicesPattern)
-	if err != nil {
-		return fmt.Errorf("unable to create vg: %w output:%s", err, output)
-	}
-
-	output, err = lvm.CreateLVS(vgName, lvName, lvSize, lvmType)
+	output, err := lvm.CreateLVS(vgName, lvName, lvSize, lvmType)
 	if err != nil {
 		return fmt.Errorf("unable to create lv: %w output:%s", err, output)
 	}

@@ -38,11 +38,8 @@ var (
 	hostWritePath     = flag.String("hostwritepath", "/etc/lvm", "host path where config, cache & backups will be written to")
 	driverName        = flag.String("drivername", "harvester-csi-driver-lvm", "name of the driver")
 	nodeID            = flag.String("nodeid", "", "node id")
-	ephemeral         = flag.Bool("ephemeral", false, "publish volumes in ephemeral mode even if kubelet did not ask for it (only needed for Kubernetes 1.15)")
 	maxVolumesPerNode = flag.Int64("maxvolumespernode", 0, "limit of volumes per node")
 	showVersion       = flag.Bool("version", false, "Show version.")
-	devicesPattern    = flag.String("devices", "", "comma-separated grok patterns of the physical volumes to use.")
-	vgName            = flag.String("vgname", "csi-lvm", "name of volume group")
 	namespace         = flag.String("namespace", "csi-lvm", "name of namespace")
 	provisionerImage  = flag.String("provisionerimage", "metalstack/csi-lvmplugin-provisioner", "name of provisioner image")
 	pullPolicy        = flag.String("pullpolicy", "ifnotpresent", "pull policy for provisioner image")
@@ -60,16 +57,12 @@ func main() {
 		return
 	}
 
-	if *ephemeral {
-		fmt.Fprintln(os.Stderr, "Deprecation warning: The ephemeral flag is deprecated and should only be used when deploying on Kubernetes 1.15. It will be removed in the future.")
-	}
-
 	handle()
 	os.Exit(0)
 }
 
 func handle() {
-	driver, err := lvm.NewLvmDriver(*driverName, *nodeID, *endpoint, *hostWritePath, *ephemeral, *maxVolumesPerNode, version, *devicesPattern, *vgName, *namespace, *provisionerImage, *pullPolicy)
+	driver, err := lvm.NewLvmDriver(*driverName, *nodeID, *endpoint, *hostWritePath, *maxVolumesPerNode, version, *namespace, *provisionerImage, *pullPolicy)
 	if err != nil {
 		fmt.Printf("Failed to initialize driver: %s\n", err.Error())
 		os.Exit(1)
