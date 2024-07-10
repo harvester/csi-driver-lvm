@@ -554,10 +554,28 @@ func extendLVS(name string, size uint64, isBlock bool) (string, error) {
 		return "", fmt.Errorf("logical volume %s does not exist", name)
 	}
 
-	// TODO: check available capacity, fail if request doesn't fit
-
 	executor := cmd.NewExecutor()
-	args := []string{"-L", fmt.Sprintf("%db", size)}
+	targetLVName := fmt.Sprintf("%s/%s", vgName, name)
+	// check current lv size
+	args := []string{"--noheadings", "--unit", "b", "-o", "Size"}
+	args = append(args, targetLVName)
+	out, err := executor.Execute("lvs", args)
+	if err != nil {
+		return "", fmt.Errorf("unable to get size of lv %s: %w", name, err)
+	}
+	lvSizeStr := strings.TrimSpace(out)
+	lvSizeStr = strings.TrimSuffix(lvSizeStr, "B")
+	klog.Infof("current size of lv %s is %s", name, lvSizeStr)
+	lvSize, err := strconv.ParseUint(lvSizeStr, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse size of lv %s: %w", name, err)
+	}
+	if lvSize == size {
+		klog.Infof("logical volume %s already has the requested size %d", name, size)
+		return "", nil
+	}
+
+	args = []string{"-L", fmt.Sprintf("%db", size)}
 	if isBlock {
 		args = append(args, "-n")
 	} else {
@@ -565,7 +583,7 @@ func extendLVS(name string, size uint64, isBlock bool) (string, error) {
 	}
 	args = append(args, fmt.Sprintf("%s/%s", vgName, name))
 	klog.Infof("lvextend %s", args)
-	out, err := executor.Execute("lvextend", args)
+	out, err = executor.Execute("lvextend", args)
 	return out, err
 }
 

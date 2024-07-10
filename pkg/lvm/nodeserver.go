@@ -230,6 +230,7 @@ func (ns *nodeServer) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVol
 
 func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 
+	klog.Infof("NodeExpandVolume: %s", req)
 	// Check arguments
 	if req.GetCapacityRange() == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
