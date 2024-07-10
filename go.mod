@@ -6,7 +6,6 @@ toolchain go1.22.3
 
 require (
 	github.com/container-storage-interface/spec v1.9.0
-	github.com/docker/go-units v0.5.0
 	github.com/harvester/go-common v0.0.0-20240709040056-22ebbe42f0f8
 	github.com/kubernetes-csi/csi-lib-utils v0.18.1
 	github.com/urfave/cli/v2 v2.27.2
