@@ -289,7 +289,7 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 				{
 					Name:    "csi-lvmplugin-" + string(va.action),
 					Image:   va.provisionerImage,
-					Command: []string{"/csi-lvmplugin-provisioner"},
+					Command: []string{"csi-lvmplugin-provisioner"},
 					Args:    args,
 					VolumeMounts: []v1.VolumeMount{
 						{
