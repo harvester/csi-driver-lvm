@@ -20,13 +20,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	cmd "github.com/harvester/go-common/command"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
@@ -151,6 +151,7 @@ func (lvm *Lvm) Run() error {
 }
 
 func mountLV(lvname, mountPath string, vgName string, fsType string) (string, error) {
+	executor := cmd.NewExecutor()
 	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvname)
 
 	formatted := false
@@ -158,19 +159,17 @@ func mountLV(lvname, mountPath string, vgName string, fsType string) (string, er
 	if fsType == "" {
 		fsType = "ext4"
 	}
-	// check for already formatted
-	cmd := exec.Command("blkid", lvPath)
-	out, err := cmd.CombinedOutput()
+	out, err := executor.Execute("blkid", []string{lvPath})
 	if err != nil {
 		klog.Infof("unable to check if %s is already formatted:%v", lvPath, err)
 	}
-	matches := fsTypeRegexp.FindStringSubmatch(string(out))
+	matches := fsTypeRegexp.FindStringSubmatch(out)
 	if len(matches) > 1 {
 		if matches[1] == "xfs_external_log" { // If old xfs signature was found
 			forceFormat = true
 		} else {
 			if matches[1] != fsType {
-				return string(out), fmt.Errorf("target fsType is %s but %s found", fsType, matches[1])
+				return out, fmt.Errorf("target fsType is %s but %s found", fsType, matches[1])
 			}
 
 			formatted = true
@@ -185,27 +184,25 @@ func mountLV(lvname, mountPath string, vgName string, fsType string) (string, er
 		formatArgs = append(formatArgs, lvPath)
 
 		klog.Infof("formatting with mkfs.%s %s", fsType, strings.Join(formatArgs, " "))
-		cmd = exec.Command(fmt.Sprintf("mkfs.%s", fsType), formatArgs...) //nolint:gosec
-		out, err = cmd.CombinedOutput()
+		out, err = executor.Execute(fmt.Sprintf("mkfs.%s", fsType), formatArgs)
 		if err != nil {
-			return string(out), fmt.Errorf("unable to format lv:%s err:%w", lvname, err)
+			return out, fmt.Errorf("unable to format lv:%s err:%w", lvname, err)
 		}
 	}
 
 	err = os.MkdirAll(mountPath, 0777|os.ModeSetgid)
 	if err != nil {
-		return string(out), fmt.Errorf("unable to create mount directory for lv:%s err:%w", lvname, err)
+		return out, fmt.Errorf("unable to create mount directory for lv:%s err:%w", lvname, err)
 	}
 
 	// --make-shared is required that this mount is visible outside this container.
 	mountArgs := []string{"--make-shared", "-t", fsType, lvPath, mountPath}
 	klog.Infof("mountlv command: mount %s", mountArgs)
-	cmd = exec.Command("mount", mountArgs...)
-	out, err = cmd.CombinedOutput()
+	out, err = executor.Execute("mount", mountArgs)
 	if err != nil {
-		mountOutput := string(out)
+		mountOutput := out
 		if !strings.Contains(mountOutput, "already mounted") {
-			return string(out), fmt.Errorf("unable to mount %s to %s err:%w output:%s", lvPath, mountPath, err, out)
+			return out, fmt.Errorf("unable to mount %s to %s err:%w output:%s", lvPath, mountPath, err, out)
 		}
 	}
 	err = os.Chmod(mountPath, 0777|os.ModeSetgid)
@@ -217,6 +214,7 @@ func mountLV(lvname, mountPath string, vgName string, fsType string) (string, er
 }
 
 func bindMountLV(lvname, mountPath string, vgName string) (string, error) {
+	executor := cmd.NewExecutor()
 	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvname)
 	_, err := os.Create(mountPath)
 	if err != nil {
@@ -227,12 +225,11 @@ func bindMountLV(lvname, mountPath string, vgName string) (string, error) {
 	// --bind is required for raw block volumes to make them visible inside the pod.
 	mountArgs := []string{"--make-shared", "--bind", lvPath, mountPath}
 	klog.Infof("bindmountlv command: mount %s", mountArgs)
-	cmd := exec.Command("mount", mountArgs...)
-	out, err := cmd.CombinedOutput()
+	out, err := executor.Execute("mount", mountArgs)
 	if err != nil {
-		mountOutput := string(out)
+		mountOutput := out
 		if !strings.Contains(mountOutput, "already mounted") {
-			return string(out), fmt.Errorf("unable to mount %s to %s err:%w output:%s", lvPath, mountPath, err, out)
+			return out, fmt.Errorf("unable to mount %s to %s err:%w output:%s", lvPath, mountPath, err, out)
 		}
 	}
 	err = os.Chmod(mountPath, 0777|os.ModeSetgid)
@@ -244,10 +241,19 @@ func bindMountLV(lvname, mountPath string, vgName string) (string, error) {
 }
 
 func umountLV(targetPath string) {
-	cmd := exec.Command("umount", "--lazy", "--force", targetPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Errorf("unable to umount %s output:%s err:%v", targetPath, string(out), err)
+	executor := cmd.NewExecutor()
+	executor.SetTimeout(30 * time.Second)
+	generalUmountArgs := []string{"--force", targetPath}
+	out, err := executor.Execute("umount", generalUmountArgs)
+	if err == cmd.ErrCmdTimeout {
+		klog.Infof("umount %s timeout, use lazy", targetPath)
+		lazyUmountArgs := []string{"--lazy", "--force", targetPath}
+		out, err := executor.Execute("umount", lazyUmountArgs)
+		if err != nil {
+			klog.Errorf("unable to umount %s output:%s err:%v", targetPath, out, err)
+		}
+	} else if err != nil {
+		klog.Errorf("unable to umount %s output:%s err:%v", targetPath, out, err)
 	}
 }
 
@@ -461,25 +467,24 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 
 // VgExists checks if the given volume group exists
 func vgExists(vgname string) bool {
-	cmd := exec.Command("vgs", vgname, "--noheadings", "-o", "vg_name")
-	out, err := cmd.CombinedOutput()
+	executor := cmd.NewExecutor()
+	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "vg_name"})
 	if err != nil {
 		klog.Infof("unable to list existing volumegroups:%v", err)
 		return false
 	}
-	return vgname == strings.TrimSpace(string(out))
+	return vgname == strings.TrimSpace(out)
 }
 
 // VgActivate execute vgchange -ay to activate all volumes of the volume group
 func vgActivate() {
+	executor := cmd.NewExecutor()
 	// scan for vgs and activate if any
-	cmd := exec.Command("vgscan")
-	out, err := cmd.CombinedOutput()
+	out, err := executor.Execute("vgscan", []string{})
 	if err != nil {
 		klog.Infof("unable to scan for volumegroups:%s %v", out, err)
 	}
-	cmd = exec.Command("vgchange", "-ay")
-	_, err = cmd.CombinedOutput()
+	_, err = executor.Execute("vgchange", []string{"-ay"})
 	if err != nil {
 		klog.Infof("unable to activate volumegroups:%s %v", out, err)
 	}
@@ -522,6 +527,8 @@ func CreateVG(name string, devicesPattern string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unable to lookup devices from devicesPattern %s, err:%w", devicesPattern, err)
 	}
+
+	executor := cmd.NewExecutor()
 	tags := []string{"harvester-csi-lvm"}
 
 	args := []string{"-v", name}
@@ -530,9 +537,8 @@ func CreateVG(name string, devicesPattern string) (string, error) {
 		args = append(args, "--addtag", tag)
 	}
 	klog.Infof("create vg with command: vgcreate %v", args)
-	cmd := exec.Command("vgcreate", args...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	out, err := executor.Execute("vgcreate", args)
+	return out, err
 }
 
 // CreateLVS creates the new volume
@@ -576,26 +582,26 @@ func CreateLVS(vg string, name string, size uint64, lvmType string) (string, err
 		return "", fmt.Errorf("unsupported lvmtype: %s", lvmType)
 	}
 
+	executor := cmd.NewExecutor()
 	tags := []string{"harvester-csi-lvm"}
 	for _, tag := range tags {
 		args = append(args, "--addtag", tag)
 	}
 	args = append(args, vg)
 	klog.Infof("lvcreate %s", args)
-	cmd := exec.Command("lvcreate", args...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	out, err := executor.Execute("lvcreate", args)
+	return out, err
 }
 
 func lvExists(vg string, name string) bool {
+	executor := cmd.NewExecutor()
 	vgname := vg + "/" + name
-	cmd := exec.Command("lvs", vgname, "--noheadings", "-o", "lv_name")
-	out, err := cmd.CombinedOutput()
+	out, err := executor.Execute("lvs", []string{vgname, "--noheadings", "-o", "lv_name"})
 	if err != nil {
 		klog.Infof("unable to list existing volumes:%v", err)
 		return false
 	}
-	return name == strings.TrimSpace(string(out))
+	return name == strings.TrimSpace(out)
 }
 
 func extendLVS(vg string, name string, size uint64, isBlock bool) (string, error) {
@@ -605,6 +611,7 @@ func extendLVS(vg string, name string, size uint64, isBlock bool) (string, error
 
 	// TODO: check available capacity, fail if request doesn't fit
 
+	executor := cmd.NewExecutor()
 	args := []string{"-L", fmt.Sprintf("%db", size)}
 	if isBlock {
 		args = append(args, "-n")
@@ -613,32 +620,57 @@ func extendLVS(vg string, name string, size uint64, isBlock bool) (string, error
 	}
 	args = append(args, fmt.Sprintf("%s/%s", vg, name))
 	klog.Infof("lvextend %s", args)
-	cmd := exec.Command("lvextend", args...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	out, err := executor.Execute("lvextend", args)
+	return out, err
 }
 
 // RemoveLVS executes lvremove
-func RemoveLVS(vg string, name string) (string, error) {
+func RemoveLVS(name string) (string, error) {
+	executor := cmd.NewExecutor()
+	// we would like to get the lvname, vgname as below:
+	// pvc-2e08db0f-01d0-462a-9da7-7da06fefd206 vg01
+	// pvc-b13348e4-3c0c-4757-b781-3e6485a16780 vg02
+	out, err := executor.Execute("lvs", []string{"--noheadings", "-o", "lv_name,vg_name"})
+	if err != nil {
+		return "", fmt.Errorf("unable to list existing volumes:%v", err)
+	}
+	lines := strings.Split(out, "\n")
+	lvVgPairs := make(map[string]string)
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			klog.Warningf("unexpected output from lvs: %s", line)
+			continue
+		}
+		lvVgPairs[parts[0]] = parts[1]
+	}
 
-	if !lvExists(vg, name) {
+	if _, ok := lvVgPairs[name]; !ok {
+		return "", fmt.Errorf("logical volume %s does not exist", name)
+	}
+	targetVgName := lvVgPairs[name]
+
+	if !lvExists(targetVgName, name) {
 		return fmt.Sprintf("logical volume %s does not exist. Assuming it has already been deleted.", name), nil
 	}
+
 	args := []string{"-q", "-y"}
-	args = append(args, fmt.Sprintf("%s/%s", vg, name))
+	args = append(args, fmt.Sprintf("%s/%s", targetVgName, name))
 	klog.Infof("lvremove %s", args)
-	cmd := exec.Command("lvremove", args...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	out, err = executor.Execute("lvremove", args)
+	return out, err
 }
 
 func pvCount(vgname string) (int, error) {
-	cmd := exec.Command("vgs", vgname, "--noheadings", "-o", "pv_count")
-	out, err := cmd.CombinedOutput()
+	executor := cmd.NewExecutor()
+	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "pv_count"})
 	if err != nil {
 		return 0, err
 	}
-	outStr := strings.TrimSpace(string(out))
+	outStr := strings.TrimSpace(out)
 	count, err := strconv.Atoi(outStr)
 	if err != nil {
 		return 0, err

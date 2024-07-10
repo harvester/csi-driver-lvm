@@ -199,7 +199,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		provisionerImage: cs.provisionerImage,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
-		vgName:           cs.vgName,
+		vgName:           "", // Deprecated. delete does not need vgName
 		hostWritePath:    cs.hostWritePath,
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {

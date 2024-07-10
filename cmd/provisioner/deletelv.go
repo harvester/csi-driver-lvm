@@ -17,10 +17,6 @@ func deleteLVCmd() *cli.Command {
 				Name:  flagLVName,
 				Usage: "Required. Specify lv name.",
 			},
-			&cli.StringFlag{
-				Name:  flagVGName,
-				Usage: "Required. the name of the volumegroup",
-			},
 		},
 		Action: func(c *cli.Context) error {
 			if err := deleteLV(c); err != nil {
@@ -37,17 +33,13 @@ func deleteLV(c *cli.Context) error {
 	if lvName == "" {
 		return fmt.Errorf("invalid empty flag %v", flagLVName)
 	}
-	vgName := c.String(flagVGName)
-	if vgName == "" {
-		return fmt.Errorf("invalid empty flag %v", flagVGName)
-	}
 
-	klog.Infof("delete lv %s vg:%s ", lvName, vgName)
+	klog.Infof("delete lv %s", lvName)
 
-	output, err := lvm.RemoveLVS(vgName, lvName)
+	output, err := lvm.RemoveLVS(lvName)
 	if err != nil {
 		return fmt.Errorf("unable to delete lv: %w output:%s", err, output)
 	}
-	klog.Infof("lv %s vg:%s deleted", lvName, vgName)
+	klog.Infof("lv %s is deleted", lvName)
 	return nil
 }
