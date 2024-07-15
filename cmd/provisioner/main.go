@@ -14,6 +14,7 @@ const (
 	flagVGName         = "vgname"
 	flagDevicesPattern = "devices"
 	flagLVMType        = "lvmtype"
+	flagSnapName       = "snapname"
 )
 
 func cmdNotFound(c *cli.Context, command string) {
@@ -30,6 +31,8 @@ func main() {
 	p.Commands = []*cli.Command{
 		createLVCmd(),
 		deleteLVCmd(),
+		createSnapCmd(),
+		deleteSnapCmd(),
 	}
 	p.CommandNotFound = cmdNotFound
 	p.OnUsageError = onUsageError

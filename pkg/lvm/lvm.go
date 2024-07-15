@@ -74,6 +74,20 @@ type volumeAction struct {
 	hostWritePath    string
 }
 
+type snapshotAction struct {
+	action           actionType
+	srcVolName       string
+	nodeName         string
+	snapshotName     string
+	snapSize         int64
+	provisionerImage string
+	pullPolicy       v1.PullPolicy
+	kubeClient       kubernetes.Clientset
+	namespace        string
+	vgName           string
+	hostWritePath    string
+}
+
 const (
 	linearType         = "linear"
 	stripedType        = "striped"
@@ -250,6 +264,70 @@ func umountLV(targetPath string) {
 	}
 }
 
+func createSnapshotterPod(ctx context.Context, sa snapshotAction) (err error) {
+	if sa.snapshotName == "" || sa.nodeName == "" {
+		klog.Errorf("invalid snapshotAction %v", sa)
+		return fmt.Errorf("invalid empty name or path or node")
+	}
+	if sa.action == actionTypeCreate && sa.srcVolName == "" {
+		klog.Errorf("invalid snapshotAction %v", sa)
+		return fmt.Errorf("createlv without srcVolName")
+	}
+	args := []string{}
+	switch sa.action {
+	case actionTypeCreate:
+		args = append(args, "createsnap", "--snapname", sa.snapshotName, "--lvname", sa.srcVolName, "--vgname", sa.vgName, "--lvsize", fmt.Sprintf("%d", sa.snapSize))
+	case actionTypeDelete:
+		args = append(args, "deletesnap", "--snapname", sa.snapshotName, "--vgname", sa.vgName)
+	default:
+		return fmt.Errorf("invalid action %v", sa.action)
+	}
+
+	klog.Infof("start snapshotterPod with args:%s", args)
+	action := fmt.Sprintf("snap-%s", sa.action)
+	snapshotterPod := genProvisionerPodContent(action, sa.snapshotName, sa.nodeName, sa.hostWritePath, sa.provisionerImage, sa.pullPolicy, args)
+
+	_, err = sa.kubeClient.CoreV1().Pods(sa.namespace).Create(ctx, snapshotterPod, metav1.CreateOptions{})
+	if err != nil && !k8serror.IsAlreadyExists(err) {
+		return err
+	}
+
+	defer func() {
+		e := sa.kubeClient.CoreV1().Pods(sa.namespace).Delete(ctx, snapshotterPod.Name, metav1.DeleteOptions{})
+		if e != nil {
+			klog.Errorf("unable to delete the snapshotter pod: %v", e)
+		}
+	}()
+
+	completed := false
+	retrySeconds := 60
+	for i := 0; i < retrySeconds; i++ {
+		pod, err := sa.kubeClient.CoreV1().Pods(sa.namespace).Get(ctx, snapshotterPod.Name, metav1.GetOptions{})
+		if pod.Status.Phase == v1.PodFailed {
+			// pod terminated in time, but with failure
+			// return ResourceExhausted so the requesting pod can be rescheduled to anonther node
+			// see https://github.com/kubernetes-csi/external-provisioner/pull/405
+			klog.Info("provisioner pod terminated with failure")
+			return status.Error(codes.ResourceExhausted, "Snapshot creation failed")
+		}
+		if err != nil {
+			klog.Errorf("error reading provisioner pod:%v", err)
+		} else if pod.Status.Phase == v1.PodSucceeded {
+			klog.Info("provisioner pod terminated successfully")
+			completed = true
+			break
+		}
+		klog.Infof("provisioner pod status:%s", pod.Status.Phase)
+		time.Sleep(1 * time.Second)
+	}
+	if !completed {
+		return fmt.Errorf("create process timeout after %v seconds", retrySeconds)
+	}
+
+	klog.Infof("Snapshot %v has been %vd on %v", sa.snapshotName, sa.action, sa.nodeName)
+	return nil
+}
+
 func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 	if va.name == "" || va.nodeName == "" {
 		return fmt.Errorf("invalid empty name or path or node")
@@ -268,152 +346,8 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 	args = append(args, "--lvname", va.name)
 
 	klog.Infof("start provisionerPod with args:%s", args)
-	hostPathTypeDirOrCreate := v1.HostPathDirectoryOrCreate
-	hostPathTypeDirectory := v1.HostPathDirectory
-	privileged := true
-	mountPropagationBidirectional := v1.MountPropagationBidirectional
-	provisionerPod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: string(va.action) + "-" + va.name,
-		},
-		Spec: v1.PodSpec{
-			RestartPolicy: v1.RestartPolicyNever,
-			NodeName:      va.nodeName,
-			Tolerations: []v1.Toleration{
-				{
-					Operator: v1.TolerationOpExists,
-				},
-			},
-			Containers: []v1.Container{
-				{
-					Name:    "csi-lvmplugin-" + string(va.action),
-					Image:   va.provisionerImage,
-					Command: []string{"csi-lvmplugin-provisioner"},
-					Args:    args,
-					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:             "devices",
-							ReadOnly:         false,
-							MountPath:        "/dev",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:      "modules",
-							ReadOnly:  false,
-							MountPath: "/lib/modules",
-						},
-						{
-							Name:             "lvmbackup",
-							ReadOnly:         false,
-							MountPath:        "/etc/lvm/backup",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:             "lvmcache",
-							ReadOnly:         false,
-							MountPath:        "/etc/lvm/cache",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:             "lvmlock",
-							ReadOnly:         false,
-							MountPath:        "/run/lock/lvm",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:      "host-lvm-conf",
-							ReadOnly:  true,
-							MountPath: "/etc/lvm/lvm.conf",
-						},
-						{
-							Name:      "host-run-udev",
-							ReadOnly:  true,
-							MountPath: "/run/udev",
-						},
-					},
-					TerminationMessagePath: "/termination.log",
-					ImagePullPolicy:        va.pullPolicy,
-					SecurityContext: &v1.SecurityContext{
-						Privileged: &privileged,
-					},
-					Resources: v1.ResourceRequirements{
-						Requests: v1.ResourceList{
-							"cpu":    resource.MustParse("50m"),
-							"memory": resource.MustParse("50Mi"),
-						},
-						Limits: v1.ResourceList{
-							"cpu":    resource.MustParse("100m"),
-							"memory": resource.MustParse("100Mi"),
-						},
-					},
-				},
-			},
-			Volumes: []v1.Volume{
-				{
-					Name: "devices",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/dev",
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "modules",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/lib/modules",
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "lvmbackup",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: filepath.Join(va.hostWritePath, "backup"),
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "lvmcache",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: filepath.Join(va.hostWritePath, "cache"),
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "lvmlock",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: filepath.Join(va.hostWritePath, "lock"),
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "host-lvm-conf",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/etc/lvm/lvm.conf",
-						},
-					},
-				},
-				{
-					Name: "host-run-udev",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/run/udev",
-							Type: &hostPathTypeDirectory,
-						},
-					},
-				},
-			},
-		},
-	}
+	action := fmt.Sprintf("lvm-%s", va.action)
+	provisionerPod := genProvisionerPodContent(action, va.name, va.nodeName, va.hostWritePath, va.provisionerImage, va.pullPolicy, args)
 
 	// If it already exists due to some previous errors, the pod will be cleaned up later automatically
 	// https://github.com/rancher/local-path-provisioner/issues/27
@@ -554,28 +488,17 @@ func extendLVS(name string, size uint64, isBlock bool) (string, error) {
 		return "", fmt.Errorf("logical volume %s does not exist", name)
 	}
 
-	executor := cmd.NewExecutor()
-	targetLVName := fmt.Sprintf("%s/%s", vgName, name)
-	// check current lv size
-	args := []string{"--noheadings", "--unit", "b", "-o", "Size"}
-	args = append(args, targetLVName)
-	out, err := executor.Execute("lvs", args)
+	lvSize, err := getLVSize(name, vgName)
 	if err != nil {
 		return "", fmt.Errorf("unable to get size of lv %s: %w", name, err)
-	}
-	lvSizeStr := strings.TrimSpace(out)
-	lvSizeStr = strings.TrimSuffix(lvSizeStr, "B")
-	klog.Infof("current size of lv %s is %s", name, lvSizeStr)
-	lvSize, err := strconv.ParseUint(lvSizeStr, 10, 64)
-	if err != nil {
-		return "", fmt.Errorf("unable to parse size of lv %s: %w", name, err)
 	}
 	if lvSize == size {
 		klog.Infof("logical volume %s already has the requested size %d", name, size)
 		return "", nil
 	}
 
-	args = []string{"-L", fmt.Sprintf("%db", size)}
+	executor := cmd.NewExecutor()
+	args := []string{"-L", fmt.Sprintf("%db", size)}
 	if isBlock {
 		args = append(args, "-n")
 	} else {
@@ -583,7 +506,7 @@ func extendLVS(name string, size uint64, isBlock bool) (string, error) {
 	}
 	args = append(args, fmt.Sprintf("%s/%s", vgName, name))
 	klog.Infof("lvextend %s", args)
-	out, err = executor.Execute("lvextend", args)
+	out, err := executor.Execute("lvextend", args)
 	return out, err
 }
 
@@ -600,6 +523,46 @@ func RemoveLVS(name string) (string, error) {
 	executor := cmd.NewExecutor()
 	args := []string{"-q", "-y"}
 	args = append(args, fmt.Sprintf("%s/%s", vgName, name))
+	klog.Infof("lvremove %s", args)
+	out, err := executor.Execute("lvremove", args)
+	return out, err
+}
+
+func CreateSnapshot(snapshotName, srcVolName, vgName string, volSize int64) (string, error) {
+	if snapshotName == "" || srcVolName == "" {
+		return "", fmt.Errorf("invalid empty name or path")
+	}
+
+	if volSize == 0 {
+		return "", fmt.Errorf("size must be greater than 0")
+	}
+
+	if !lvExists(vgName, srcVolName) {
+		return "", fmt.Errorf("logical volume %s does not exist", srcVolName)
+	}
+
+	executor := cmd.NewExecutor()
+	// Names starting "snapshot" are reserved for internal use by LVM
+	// we patch new snapName as "lvm-<snapshotName>"
+	snapshotName = fmt.Sprintf("lvm-%s", snapshotName)
+	args := []string{"-s", "-y", "-n", snapshotName, "-L", fmt.Sprintf("%db", volSize)}
+	args = append(args, fmt.Sprintf("/dev/%s/%s", vgName, srcVolName))
+	klog.Infof("lvcreate %s", args)
+	out, err := executor.Execute("lvcreate", args)
+	return out, err
+}
+
+func DeleteSnapshot(snapshotName, vgName string) (string, error) {
+	if snapshotName == "" {
+		return "", fmt.Errorf("invalid empty name")
+	}
+
+	executor := cmd.NewExecutor()
+	// Names starting "snapshot" are reserved for internal use by LVM
+	// we patch new snapName as "lvm-<snapshotName>"
+	snapshotName = fmt.Sprintf("lvm-%s", snapshotName)
+	args := []string{"-q", "-y"}
+	args = append(args, fmt.Sprintf("/dev/%s/%s", vgName, snapshotName))
 	klog.Infof("lvremove %s", args)
 	out, err := executor.Execute("lvremove", args)
 	return out, err
@@ -648,4 +611,184 @@ func getRelatedVG(lvname string) (string, error) {
 	relatedVgName := lvVgPairs[lvname]
 
 	return relatedVgName, nil
+}
+
+func getLVSize(lvName, vgName string) (uint64, error) {
+	var err error
+	if vgName == "" {
+		vgName, err = getRelatedVG(lvName)
+		if err != nil {
+			return 0, fmt.Errorf("unable to get related vg for lv %s: %w", lvName, err)
+		}
+		if !lvExists(vgName, lvName) {
+			return 0, fmt.Errorf("logical volume %s does not exist", lvName)
+		}
+	}
+	executor := cmd.NewExecutor()
+	targetLVName := fmt.Sprintf("%s/%s", vgName, lvName)
+	// check current lv size
+	args := []string{"--noheadings", "--unit", "b", "-o", "Size"}
+	args = append(args, targetLVName)
+	out, err := executor.Execute("lvs", args)
+	if err != nil {
+		return 0, fmt.Errorf("unable to get size of lv %s: %w", lvName, err)
+	}
+	lvSizeStr := strings.TrimSpace(out)
+	lvSizeStr = strings.TrimSuffix(lvSizeStr, "B")
+	klog.Infof("current size of lv %s is %s", lvName, lvSizeStr)
+	lvSize, err := strconv.ParseUint(lvSizeStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unable to parse size of lv %s: %w", lvName, err)
+	}
+	return lvSize, nil
+}
+
+func genProvisionerPodContent(action, name, targetNode, hostWritePath, provisionerImage string, pullPolicy v1.PullPolicy, args []string) *v1.Pod {
+	hostPathTypeDirOrCreate := v1.HostPathDirectoryOrCreate
+	hostPathTypeDirectory := v1.HostPathDirectory
+	privileged := true
+	mountPropagationBidirectional := v1.MountPropagationBidirectional
+	targetPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: string(action) + "-" + name,
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy: v1.RestartPolicyNever,
+			NodeName:      targetNode,
+			Tolerations: []v1.Toleration{
+				{
+					Operator: v1.TolerationOpExists,
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name:    "csi-lvmplugin-" + string(action),
+					Image:   provisionerImage,
+					Command: []string{"csi-lvmplugin-provisioner"},
+					Args:    args,
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:             "devices",
+							ReadOnly:         false,
+							MountPath:        "/dev",
+							MountPropagation: &mountPropagationBidirectional,
+						},
+						{
+							Name:      "modules",
+							ReadOnly:  false,
+							MountPath: "/lib/modules",
+						},
+						{
+							Name:             "lvmbackup",
+							ReadOnly:         false,
+							MountPath:        "/etc/lvm/backup",
+							MountPropagation: &mountPropagationBidirectional,
+						},
+						{
+							Name:             "lvmcache",
+							ReadOnly:         false,
+							MountPath:        "/etc/lvm/cache",
+							MountPropagation: &mountPropagationBidirectional,
+						},
+						{
+							Name:             "lvmlock",
+							ReadOnly:         false,
+							MountPath:        "/run/lock/lvm",
+							MountPropagation: &mountPropagationBidirectional,
+						},
+						{
+							Name:      "host-lvm-conf",
+							ReadOnly:  true,
+							MountPath: "/etc/lvm/lvm.conf",
+						},
+						{
+							Name:      "host-run-udev",
+							ReadOnly:  true,
+							MountPath: "/run/udev",
+						},
+					},
+					TerminationMessagePath: "/termination.log",
+					ImagePullPolicy:        pullPolicy,
+					SecurityContext: &v1.SecurityContext{
+						Privileged: &privileged,
+					},
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							"cpu":    resource.MustParse("50m"),
+							"memory": resource.MustParse("50Mi"),
+						},
+						Limits: v1.ResourceList{
+							"cpu":    resource.MustParse("100m"),
+							"memory": resource.MustParse("100Mi"),
+						},
+					},
+				},
+			},
+			Volumes: []v1.Volume{
+				{
+					Name: "devices",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/dev",
+							Type: &hostPathTypeDirOrCreate,
+						},
+					},
+				},
+				{
+					Name: "modules",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/lib/modules",
+							Type: &hostPathTypeDirOrCreate,
+						},
+					},
+				},
+				{
+					Name: "lvmbackup",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: filepath.Join(hostWritePath, "backup"),
+							Type: &hostPathTypeDirOrCreate,
+						},
+					},
+				},
+				{
+					Name: "lvmcache",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: filepath.Join(hostWritePath, "cache"),
+							Type: &hostPathTypeDirOrCreate,
+						},
+					},
+				},
+				{
+					Name: "lvmlock",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: filepath.Join(hostWritePath, "lock"),
+							Type: &hostPathTypeDirOrCreate,
+						},
+					},
+				},
+				{
+					Name: "host-lvm-conf",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/etc/lvm/lvm.conf",
+						},
+					},
+				},
+				{
+					Name: "host-run-udev",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/run/udev",
+							Type: &hostPathTypeDirectory,
+						},
+					},
+				},
+			},
+		},
+	}
+	return targetPod
 }

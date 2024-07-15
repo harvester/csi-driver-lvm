@@ -18,11 +18,14 @@ package lvm
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	snapclient "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	v1 "k8s.io/api/core/v1"
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +42,7 @@ type controllerServer struct {
 	provisionerImage string
 	pullPolicy       v1.PullPolicy
 	namespace        string
+	snapClient       *snapclient.Clientset
 }
 
 // NewControllerServer
@@ -52,12 +56,16 @@ func newControllerServer(nodeID string, hostWritePath string, namespace string, 
 	if err != nil {
 		return nil, err
 	}
+	snapClient, err := snapclient.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
 	return &controllerServer{
 		caps: getControllerServiceCapabilities(
 			[]csi.ControllerServiceCapability_RPC_Type{
 				csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 				// TODO
-				//				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 				//				csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 				//				csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 				//				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
@@ -68,6 +76,7 @@ func newControllerServer(nodeID string, hostWritePath string, namespace string, 
 		namespace:        namespace,
 		provisionerImage: provisionerImage,
 		pullPolicy:       pullPolicy,
+		snapClient:       snapClient,
 	}, nil
 }
 
@@ -291,11 +300,100 @@ func (cs *controllerServer) ListVolumes(ctx context.Context, req *csi.ListVolume
 }
 
 func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	klog.Infof("CreateSnapshot req: %v", req)
+	volID := req.GetSourceVolumeId()
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+	klog.V(4).Infof("taking snapshot with volume %s ", volume)
+	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
+	node := ns[0].MatchExpressions[0].Values[0]
+	vgName := volume.Spec.CSI.VolumeAttributes["vgName"]
+	snapSizeStr := volume.Spec.CSI.VolumeAttributes["RequiredBytes"]
+	snapSize, err := strconv.ParseInt(snapSizeStr, 10, 64)
+	if err != nil {
+		klog.Errorf("error parsing snapSize: %v", err)
+		return nil, err
+	}
+	snapshotName := req.GetName()
+	snapTimestamp := &timestamppb.Timestamp{
+		Seconds: time.Now().Unix(),
+	}
+
+	sa := snapshotAction{
+		action:           actionTypeCreate,
+		srcVolName:       volID,
+		snapshotName:     snapshotName,
+		nodeName:         node,
+		snapSize:         snapSize,
+		vgName:           vgName,
+		hostWritePath:    cs.hostWritePath,
+		kubeClient:       cs.kubeClient,
+		namespace:        cs.namespace,
+		provisionerImage: cs.provisionerImage,
+		pullPolicy:       cs.pullPolicy,
+	}
+	if err := createSnapshotterPod(ctx, sa); err != nil {
+		klog.Errorf("error creating provisioner pod :%v", err)
+		return nil, err
+	}
+
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SnapshotId:     snapshotName,
+			SourceVolumeId: volID,
+			SizeBytes:      snapSize,
+			CreationTime:   snapTimestamp,
+			ReadyToUse:     true,
+		},
+	}, nil
 }
 
 func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	klog.Infof("DeleteSnapshot req: %v", req)
+	snapName := req.GetSnapshotId()
+	snapshotsList, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Errorf("error listing snapshots: %v", err)
+		return nil, err
+	}
+	volID := ""
+	for _, snap := range snapshotsList.Items {
+		if *snap.Status.SnapshotHandle == snapName {
+			volID = *snap.Spec.Source.VolumeHandle
+		}
+	}
+	if volID == "" {
+		klog.Errorf("snapshot %s not found", snapName)
+		return nil, status.Error(codes.NotFound, "snapshot not found")
+	}
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+	klog.V(4).Infof("deleting snapshot with volume %s ", snapName)
+	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
+	node := ns[0].MatchExpressions[0].Values[0]
+	vgName := volume.Spec.CSI.VolumeAttributes["vgName"]
+
+	sa := snapshotAction{
+		action:           actionTypeDelete,
+		snapshotName:     snapName,
+		nodeName:         node,
+		vgName:           vgName,
+		hostWritePath:    cs.hostWritePath,
+		kubeClient:       cs.kubeClient,
+		namespace:        cs.namespace,
+		provisionerImage: cs.provisionerImage,
+		pullPolicy:       cs.pullPolicy,
+	}
+	if err := createSnapshotterPod(ctx, sa); err != nil {
+		klog.Errorf("error creating provisioner pod :%v", err)
+		return nil, err
+	}
+
+	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (cs *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
