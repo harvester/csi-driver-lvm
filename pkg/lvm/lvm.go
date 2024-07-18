@@ -27,11 +27,11 @@ import (
 	"time"
 
 	cmd "github.com/harvester/go-common/command"
+	ioutil "github.com/harvester/go-common/io"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -72,6 +72,7 @@ type volumeAction struct {
 	namespace        string
 	vgName           string
 	hostWritePath    string
+	srcDev           string
 }
 
 type snapshotAction struct {
@@ -94,8 +95,10 @@ const (
 	mirrorType         = "mirror"
 	actionTypeCreate   = "create"
 	actionTypeDelete   = "delete"
+	actionTypeClone    = "clone"
 	pullIfNotPresent   = "ifnotpresent"
 	fsTypeRegexpString = `TYPE="(\w+)"`
+	DefaultChunkSize   = 4 * 1024 * 1024
 )
 
 var (
@@ -337,11 +340,15 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 	}
 
 	args := []string{}
-	if va.action == actionTypeCreate {
+	switch va.action {
+	case actionTypeCreate:
 		args = append(args, "createlv", "--lvsize", fmt.Sprintf("%d", va.size), "--lvmtype", va.lvmType, "--vgname", va.vgName)
-	}
-	if va.action == actionTypeDelete {
+	case actionTypeDelete:
 		args = append(args, "deletelv")
+	case actionTypeClone:
+		args = append(args, "clonelv", "--srcdev", va.srcDev, "--lvsize", fmt.Sprintf("%d", va.size), "--vgname", va.vgName, "--lvmtype", va.lvmType)
+	default:
+		return fmt.Errorf("invalid action %v", va.action)
 	}
 	args = append(args, "--lvname", va.name)
 
@@ -568,6 +575,10 @@ func DeleteSnapshot(snapshotName, vgName string) (string, error) {
 	return out, err
 }
 
+func CloneDevice(src, dst *os.File) error {
+	return ioutil.Copy(src, dst, DefaultChunkSize)
+}
+
 func pvCount(vgname string) (int, error) {
 	executor := cmd.NewExecutor()
 	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "pv_count"})
@@ -711,16 +722,6 @@ func genProvisionerPodContent(action, name, targetNode, hostWritePath, provision
 					ImagePullPolicy:        pullPolicy,
 					SecurityContext: &v1.SecurityContext{
 						Privileged: &privileged,
-					},
-					Resources: v1.ResourceRequirements{
-						Requests: v1.ResourceList{
-							"cpu":    resource.MustParse("50m"),
-							"memory": resource.MustParse("50Mi"),
-						},
-						Limits: v1.ResourceList{
-							"cpu":    resource.MustParse("100m"),
-							"memory": resource.MustParse("100Mi"),
-						},
 					},
 				},
 			},
