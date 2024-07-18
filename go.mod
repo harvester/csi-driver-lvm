@@ -1,8 +1,6 @@
 module github.com/harvester/csi-driver-lvm
 
-go 1.22.0
-
-toolchain go1.22.3
+go 1.22.5
 
 require (
 	github.com/container-storage-interface/spec v1.9.0
@@ -12,7 +10,7 @@ require (
 	github.com/urfave/cli/v2 v2.27.2
 	golang.org/x/net v0.27.0
 	golang.org/x/sys v0.22.0
-	google.golang.org/grpc v1.64.0
+	google.golang.org/grpc v1.64.1
 	google.golang.org/protobuf v1.34.2
 	k8s.io/api v0.30.2
 	k8s.io/apimachinery v0.30.2
