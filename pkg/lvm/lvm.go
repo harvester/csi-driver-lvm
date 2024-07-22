@@ -60,6 +60,13 @@ var (
 
 type actionType string
 
+// source lv could be a generic volume or a snapshot
+type srcInfo struct {
+	srcLVName string
+	srcVGName string
+	srcType   string
+}
+
 type volumeAction struct {
 	action           actionType
 	name             string
@@ -72,7 +79,8 @@ type volumeAction struct {
 	namespace        string
 	vgName           string
 	hostWritePath    string
-	srcDev           string
+	srcInfo          *srcInfo
+	//srcDev           string
 }
 
 type snapshotAction struct {
@@ -86,13 +94,15 @@ type snapshotAction struct {
 	kubeClient       kubernetes.Clientset
 	namespace        string
 	vgName           string
+	lvType           string
 	hostWritePath    string
 }
 
 const (
-	linearType         = "linear"
-	stripedType        = "striped"
-	mirrorType         = "mirror"
+	ThinVolType        = "thin"
+	ThinPoolType       = "thin-pool"
+	StripedType        = "striped"
+	DmThinType         = "dm-thin"
 	actionTypeCreate   = "create"
 	actionTypeDelete   = "delete"
 	actionTypeClone    = "clone"
@@ -279,7 +289,7 @@ func createSnapshotterPod(ctx context.Context, sa snapshotAction) (err error) {
 	args := []string{}
 	switch sa.action {
 	case actionTypeCreate:
-		args = append(args, "createsnap", "--snapname", sa.snapshotName, "--lvname", sa.srcVolName, "--vgname", sa.vgName, "--lvsize", fmt.Sprintf("%d", sa.snapSize))
+		args = append(args, "createsnap", "--snapname", sa.snapshotName, "--lvname", sa.srcVolName, "--vgname", sa.vgName, "--lvsize", fmt.Sprintf("%d", sa.snapSize), "--lvmtype", sa.lvType)
 	case actionTypeDelete:
 		args = append(args, "deletesnap", "--snapname", sa.snapshotName, "--vgname", sa.vgName)
 	default:
@@ -344,9 +354,9 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 	case actionTypeCreate:
 		args = append(args, "createlv", "--lvsize", fmt.Sprintf("%d", va.size), "--lvmtype", va.lvmType, "--vgname", va.vgName)
 	case actionTypeDelete:
-		args = append(args, "deletelv")
+		args = append(args, "deletelv", "--srcvgname", va.srcInfo.srcVGName, "--srctype", va.srcInfo.srcType)
 	case actionTypeClone:
-		args = append(args, "clonelv", "--srcdev", va.srcDev, "--lvsize", fmt.Sprintf("%d", va.size), "--vgname", va.vgName, "--lvmtype", va.lvmType)
+		args = append(args, "clonelv", "--srclvname", va.srcInfo.srcLVName, "--srcvgname", va.srcInfo.srcVGName, "--srctype", va.srcInfo.srcType, "--lvsize", fmt.Sprintf("%d", va.size), "--vgname", va.vgName, "--lvmtype", va.lvmType)
 	default:
 		return fmt.Errorf("invalid action %v", va.action)
 	}
@@ -436,40 +446,51 @@ func CreateLVS(vg string, name string, size uint64, lvmType string) (string, err
 		return "", fmt.Errorf("size must be greater than 0")
 	}
 
-	if !(lvmType == "linear" || lvmType == "mirror" || lvmType == "striped") {
-		return "", fmt.Errorf("lvmType is incorrect: %s", lvmType)
-	}
-
 	// TODO: check available capacity, fail if request doesn't fit
 
-	args := []string{"-v", "--yes", "-n", name, "-W", "y", "-L", fmt.Sprintf("%db", size)}
+	executor := cmd.NewExecutor()
+	thinPoolName := ""
+	// we need to create thin pool first if the lvmType is dm-thin
+	if lvmType == DmThinType {
+		thinPoolName = fmt.Sprintf("%s-thinpool", vg)
+		found, err := getThinPool(vg, thinPoolName)
+		if err != nil {
+			return "", fmt.Errorf("unable to determine if thinpool exists: %w", err)
+		}
+		if !found {
+			args := []string{"-l90%FREE", "--thinpool", thinPoolName, vg}
+			klog.Infof("lvcreate %s", args)
+			_, err := executor.Execute("lvcreate", args)
+			if err != nil {
+				return "", fmt.Errorf("unable to create thinpool: %w", err)
+			}
+		}
+	}
+
+	args := []string{"-v", "--yes", "-n", name, "-W", "y"}
 
 	pvs, err := pvCount(vg)
 	if err != nil {
 		return "", fmt.Errorf("unable to determine pv count of vg: %w", err)
 	}
 
-	if pvs < 2 {
-		klog.Warning("pvcount is <2 only linear is supported")
-		lvmType = linearType
+	if pvs < 2 && lvmType == StripedType {
+		klog.Warning("pvcount is <2, the striped does not meaningful.")
 	}
 
 	switch lvmType {
-	case stripedType:
-		args = append(args, "--type", "striped", "--stripes", fmt.Sprintf("%d", pvs))
-	case mirrorType:
-		args = append(args, "--type", "raid1", "--mirrors", "1", "--nosync")
-	case linearType:
+	case StripedType:
+		args = append(args, "-L", fmt.Sprintf("%db", size), "--type", "striped", "--stripes", fmt.Sprintf("%d", pvs), vg)
+	case DmThinType:
+		args = append(args, "-V", fmt.Sprintf("%db", size), "--thin-pool", thinPoolName, vg)
 	default:
 		return "", fmt.Errorf("unsupported lvmtype: %s", lvmType)
 	}
 
-	executor := cmd.NewExecutor()
 	tags := []string{"harvester-csi-lvm"}
 	for _, tag := range tags {
 		args = append(args, "--addtag", tag)
 	}
-	args = append(args, vg)
 	klog.Infof("lvcreate %s", args)
 	out, err := executor.Execute("lvcreate", args)
 	return out, err
@@ -535,7 +556,7 @@ func RemoveLVS(name string) (string, error) {
 	return out, err
 }
 
-func CreateSnapshot(snapshotName, srcVolName, vgName string, volSize int64) (string, error) {
+func CreateSnapshot(snapshotName, srcVolName, vgName string, volSize int64, lvType string, forClone bool) (string, error) {
 	if snapshotName == "" || srcVolName == "" {
 		return "", fmt.Errorf("invalid empty name or path")
 	}
@@ -551,9 +572,23 @@ func CreateSnapshot(snapshotName, srcVolName, vgName string, volSize int64) (str
 	executor := cmd.NewExecutor()
 	// Names starting "snapshot" are reserved for internal use by LVM
 	// we patch new snapName as "lvm-<snapshotName>"
-	snapshotName = fmt.Sprintf("lvm-%s", snapshotName)
-	args := []string{"-s", "-y", "-n", snapshotName, "-L", fmt.Sprintf("%db", volSize)}
-	args = append(args, fmt.Sprintf("/dev/%s/%s", vgName, srcVolName))
+	// parameters: -s, -y, -a n, -n, snapshotName, (-L, volSize), vgName/srcVolName
+	args := []string{"-s", "-y"}
+	if !forClone {
+		args = append(args, "-a", "n")
+		snapshotName = fmt.Sprintf("lvm-%s", snapshotName)
+	}
+	args = append(args, "-n", snapshotName)
+	switch lvType {
+	case StripedType:
+		args = append(args, "-L", fmt.Sprintf("%db", volSize))
+	case DmThinType:
+		// no-size option for the dm-thin
+		break
+	default:
+		return "", fmt.Errorf("unsupported lvmtype: %s", lvType)
+	}
+	args = append(args, fmt.Sprintf("%s/%s", vgName, srcVolName))
 	klog.Infof("lvcreate %s", args)
 	out, err := executor.Execute("lvcreate", args)
 	return out, err
@@ -579,6 +614,28 @@ func CloneDevice(src, dst *os.File) error {
 	return ioutil.Copy(src, dst, DefaultChunkSize)
 }
 
+func RemoveThinPool(vgName string) error {
+	// if the vg is not empty, we should skip this steps
+	targetThinPool := fmt.Sprintf("%s-thinpool", vgName)
+	thinPoolInfo, err := getThinPoolAndCounts(vgName)
+	if err != nil {
+		return fmt.Errorf("unable to get thinpool and count: %w", err)
+	}
+	if _, ok := thinPoolInfo[targetThinPool]; !ok {
+		klog.Infof("thinpool %s does not exist, skip remove!", targetThinPool)
+		return nil
+	}
+	if thinPoolInfo[targetThinPool] > 0 {
+		klog.Infof("thinpool %s is not empty, skip remove!", targetThinPool)
+		return nil
+	}
+	_, err = RemoveLVS(targetThinPool)
+	if err != nil {
+		return fmt.Errorf("unable to remove thinpool: %w", err)
+	}
+	return nil
+}
+
 func pvCount(vgname string) (int, error) {
 	executor := cmd.NewExecutor()
 	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "pv_count"})
@@ -591,6 +648,55 @@ func pvCount(vgname string) (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+func getThinPoolAndCounts(vgName string) (map[string]int, error) {
+	executor := cmd.NewExecutor()
+	// we would like to get the segtype, name as below:
+	// thin thinvol01    <-- this is volume
+	// thin-pool vg02-thinpool 1  <-- this is thin-pool
+	args := []string{"--noheadings", "-o", "segtype,name,thin_count", vgName}
+	out, err := executor.Execute("lvs", args)
+	if err != nil {
+		klog.Infof("execute lvs %s, err: %v", args, err)
+		return nil, err
+	}
+	lines := strings.Split(out, "\n")
+	// type[Name]
+	// type: thin -> vol name
+	//       thin-pool -> pool name -> thin_count
+	thinInfo := make(map[string]int)
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			klog.Infof("Skip thin info: %s", line)
+			continue
+		}
+		// confirm again, we only care about thin-pool
+		// thinInfo: map[<thin pool>]:<thin count>
+		if parts[0] == ThinPoolType {
+			count, err := strconv.Atoi(parts[2])
+			if err != nil {
+				return nil, err
+			}
+			thinInfo[parts[1]] = count
+		}
+	}
+	return thinInfo, nil
+}
+
+func getThinPool(vgName, thinpoolName string) (bool, error) {
+	thinPoolInfo, err := getThinPoolAndCounts(vgName)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := thinPoolInfo[thinpoolName]; ok {
+		return true, nil
+	}
+	return false, nil
 }
 
 func getRelatedVG(lvname string) (string, error) {

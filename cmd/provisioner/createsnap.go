@@ -30,6 +30,10 @@ func createSnapCmd() *cli.Command {
 				Name:  flagLVName,
 				Usage: "Required. the name of the volumegroup",
 			},
+			&cli.StringFlag{
+				Name:  flagLVMType,
+				Usage: "Required. the type of the source lvm",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			if err := createSnap(c); err != nil {
@@ -58,6 +62,10 @@ func createSnap(c *cli.Context) error {
 	if snapName == "" {
 		return fmt.Errorf("invalid empty flag %v", flagLVMType)
 	}
+	lvType := c.String(flagLVMType)
+	if lvType == "" {
+		return fmt.Errorf("invalid empty flag %v", flagLVMType)
+	}
 
 	klog.Infof("create snapshot: %s source size: %d source lv: %s/%s", snapName, lvSize, vgName, lvName)
 
@@ -69,7 +77,7 @@ func createSnap(c *cli.Context) error {
 		}
 	}
 
-	output, err := lvm.CreateSnapshot(snapName, lvName, vgName, lvSize)
+	output, err := lvm.CreateSnapshot(snapName, lvName, vgName, lvSize, lvType, !createSnapshotForClone)
 	if err != nil {
 		return fmt.Errorf("unable to create Snapshot: %w output:%s", err, output)
 	}

@@ -116,7 +116,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	lvmType := req.GetParameters()["type"]
-	if !(lvmType == "linear" || lvmType == "mirror" || lvmType == "striped") {
+	if !(lvmType == "striped" || lvmType == "dm-thin") {
 		return nil, status.Errorf(codes.Internal, "lvmType is incorrect: %s", lvmType)
 	}
 
@@ -205,11 +205,17 @@ func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *
 	ns := srcVol.Spec.NodeAffinity.Required.NodeSelectorTerms
 	srcNode := ns[0].MatchExpressions[0].Values[0]
 	srcVgName := srcVol.Spec.CSI.VolumeAttributes["vgName"]
+	srcVgType := srcVol.Spec.CSI.VolumeAttributes["type"]
 	restoreSize := *snapContent.Status.RestoreSize
 
 	snapshotLVName := fmt.Sprintf("lvm-%s", *snapContent.Status.SnapshotHandle)
-	srcSnapDev := fmt.Sprintf("/dev/%s/%s", srcVgName, snapshotLVName)
-	klog.V(4).Infof("cloning volume from %s ", srcSnapDev)
+	//srcSnapDev := fmt.Sprintf("/dev/%s/%s", srcVgName, snapshotLVName)
+	srcInfo := &srcInfo{
+		srcLVName: snapshotLVName,
+		srcVGName: srcVgName,
+		srcType:   srcVgType,
+	}
+	klog.V(4).Infof("cloning volume from %s/%s ", srcVgName, snapshotLVName)
 
 	if restoreSize > dstSize {
 		return status.Error(codes.InvalidArgument, "source volume size is larger than destination volume size")
@@ -230,7 +236,7 @@ func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *
 		namespace:        cs.namespace,
 		vgName:           dstVGName,
 		hostWritePath:    cs.hostWritePath,
-		srcDev:           srcSnapDev,
+		srcInfo:          srcInfo,
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
@@ -244,14 +250,22 @@ func (cs *controllerServer) cloneFromVolume(ctx context.Context, srcVol *v1.Pers
 	ns := srcVol.Spec.NodeAffinity.Required.NodeSelectorTerms
 	srcNode := ns[0].MatchExpressions[0].Values[0]
 	srcVgName := srcVol.Spec.CSI.VolumeAttributes["vgName"]
+	srcType := srcVol.Spec.CSI.VolumeAttributes["type"]
 	srcSizeStr := srcVol.Spec.CSI.VolumeAttributes["RequiredBytes"]
 	srcSize, err := strconv.ParseInt(srcSizeStr, 10, 64)
 	if err != nil {
 		klog.Errorf("error parsing srcSize: %v", err)
 		return err
 	}
-	srcDev := fmt.Sprintf("/dev/%s/%s", srcVgName, srcVol.GetName())
-	klog.V(4).Infof("cloning volume from %s ", srcDev)
+
+	//srcDev := fmt.Sprintf("/dev/%s/%s", srcVgName, srcVol.GetName())
+	srcLVName := srcVol.GetName()
+	srcInfo := &srcInfo{
+		srcLVName: srcLVName,
+		srcVGName: srcVgName,
+		srcType:   srcType,
+	}
+	klog.V(4).Infof("cloning volume from %s/%s ", srcVgName, srcLVName)
 
 	if srcSize > dstSize {
 		return status.Error(codes.InvalidArgument, "source volume size is larger than destination volume size")
@@ -272,7 +286,7 @@ func (cs *controllerServer) cloneFromVolume(ctx context.Context, srcVol *v1.Pers
 		namespace:        cs.namespace,
 		vgName:           dstVGName,
 		hostWritePath:    cs.hostWritePath,
-		srcDev:           srcDev,
+		srcInfo:          srcInfo,
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
@@ -302,6 +316,13 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	klog.V(4).Infof("volume %s to be deleted", volume)
 	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
 	node := ns[0].MatchExpressions[0].Values[0]
+	srcVgName := volume.Spec.CSI.VolumeAttributes["vgName"]
+	srcType := volume.Spec.CSI.VolumeAttributes["type"]
+	srcInfo := &srcInfo{
+		srcLVName: volID,
+		srcVGName: srcVgName,
+		srcType:   srcType,
+	}
 
 	klog.V(4).Infof("from node %s ", node)
 
@@ -318,13 +339,14 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 	va := volumeAction{
 		action:           actionTypeDelete,
-		name:             req.GetVolumeId(),
+		name:             volID,
 		nodeName:         node,
 		pullPolicy:       cs.pullPolicy,
 		provisionerImage: cs.provisionerImage,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
 		hostWritePath:    cs.hostWritePath,
+		srcInfo:          srcInfo,
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
@@ -430,6 +452,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
 	node := ns[0].MatchExpressions[0].Values[0]
 	vgName := volume.Spec.CSI.VolumeAttributes["vgName"]
+	lvType := volume.Spec.CSI.VolumeAttributes["type"]
 	snapSizeStr := volume.Spec.CSI.VolumeAttributes["RequiredBytes"]
 	snapSize, err := strconv.ParseInt(snapSizeStr, 10, 64)
 	if err != nil {
@@ -448,6 +471,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		nodeName:         node,
 		snapSize:         snapSize,
 		vgName:           vgName,
+		lvType:           lvType,
 		hostWritePath:    cs.hostWritePath,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
@@ -502,6 +526,7 @@ func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 		snapshotName:     snapName,
 		nodeName:         node,
 		vgName:           vgName,
+		lvType:           "", // not used
 		hostWritePath:    cs.hostWritePath,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,

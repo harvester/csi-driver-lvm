@@ -9,13 +9,17 @@ import (
 )
 
 const (
-	flagLVName         = "lvname"
-	flagLVSize         = "lvsize"
-	flagVGName         = "vgname"
-	flagDevicesPattern = "devices"
-	flagLVMType        = "lvmtype"
-	flagSnapName       = "snapname"
-	flagSrcDev         = "srcdev"
+	flagLVName             = "lvname"
+	flagLVSize             = "lvsize"
+	flagVGName             = "vgname"
+	flagDevicesPattern     = "devices"
+	flagLVMType            = "lvmtype"
+	flagSnapName           = "snapname"
+	flagSrcLVName          = "srclvname"
+	flagSrcVGName          = "srcvgname"
+	flagSrcType            = "srctype"
+	createSnapshotForClone = true
+	snapshotPrefix         = "lvm-snapshot-"
 )
 
 func cmdNotFound(c *cli.Context, command string) {

@@ -17,6 +17,14 @@ func deleteLVCmd() *cli.Command {
 				Name:  flagLVName,
 				Usage: "Required. Specify lv name.",
 			},
+			&cli.StringFlag{
+				Name:  flagSrcVGName,
+				Usage: "Required. Source VG name",
+			},
+			&cli.StringFlag{
+				Name:  flagSrcType,
+				Usage: "Required. Source type, can be either striped or dm-thin",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			if err := deleteLV(c); err != nil {
@@ -33,12 +41,26 @@ func deleteLV(c *cli.Context) error {
 	if lvName == "" {
 		return fmt.Errorf("invalid empty flag %v", flagLVName)
 	}
+	vgName := c.String(flagSrcVGName)
+	if vgName == "" {
+		return fmt.Errorf("invalid empty flag %v", flagSrcVGName)
+	}
+	vgType := c.String(flagSrcType)
+	if vgType == "" {
+		return fmt.Errorf("invalid empty flag %v", flagSrcType)
+	}
 
 	klog.Infof("delete lv %s", lvName)
 
 	output, err := lvm.RemoveLVS(lvName)
 	if err != nil {
 		return fmt.Errorf("unable to delete lv: %w output:%s", err, output)
+	}
+	if vgType == lvm.DmThinType {
+		err := lvm.RemoveThinPool(vgName)
+		if err != nil {
+			return fmt.Errorf("unable to delete thinpool: %w output:%s", err, output)
+		}
 	}
 	klog.Infof("lv %s is deleted", lvName)
 	return nil

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,8 +18,16 @@ func cloneLVCmd() *cli.Command {
 		Name: "clonelv",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:  flagSrcDev,
-				Usage: "Required. Source device name.",
+				Name:  flagSrcLVName,
+				Usage: "Required. Source LV name.",
+			},
+			&cli.StringFlag{
+				Name:  flagSrcVGName,
+				Usage: "Required. Source VG name",
+			},
+			&cli.StringFlag{
+				Name:  flagSrcType,
+				Usage: "Required. Source type, can be either striped or dm-thin",
 			},
 			&cli.StringFlag{
 				Name:  flagLVName,
@@ -48,9 +57,17 @@ func cloneLVCmd() *cli.Command {
 }
 
 func clonelv(c *cli.Context) error {
-	srcDev := c.String(flagSrcDev)
-	if srcDev == "" {
-		return fmt.Errorf("invalid empty flag %v", flagSrcDev)
+	srcLvName := c.String(flagSrcLVName)
+	if srcLvName == "" {
+		return fmt.Errorf("invalid empty flag %v", flagSrcLVName)
+	}
+	srcVgName := c.String(flagSrcVGName)
+	if srcVgName == "" {
+		return fmt.Errorf("invalid empty flag %v", flagSrcVGName)
+	}
+	srcType := c.String(flagSrcType)
+	if srcType == "" {
+		return fmt.Errorf("invalid empty flag %v", flagSrcType)
 	}
 	dstLV := c.String(flagLVName)
 	if dstLV == "" {
@@ -69,14 +86,7 @@ func clonelv(c *cli.Context) error {
 		return fmt.Errorf("invalid empty flag %v", flagLVSize)
 	}
 
-	klog.Infof("Clone from src:%s, to dst: %s/%s", srcDev, dstVGName, dstLV)
-
-	// check source dev
-	src, err := os.OpenFile(srcDev, syscall.O_RDONLY|syscall.O_DIRECT, 0)
-	if err != nil {
-		return fmt.Errorf("unable to open source device: %w", err)
-	}
-	defer src.Close()
+	klog.Infof("Clone from src: %s, to dst: %s/%s", srcLvName, dstVGName, dstLV)
 
 	if !lvm.VgExists(dstVGName) {
 		lvm.VgActivate()
@@ -85,6 +95,25 @@ func clonelv(c *cli.Context) error {
 			return fmt.Errorf("vg %s does not exist, please check the corresponding VG is created", dstVGName)
 		}
 	}
+
+	klog.Infof("clone lv %s, vg: %s, type: %s", srcLvName, srcVgName, srcType)
+	if strings.HasPrefix(srcLvName, snapshotPrefix) && srcType == lvm.DmThinType && srcType == dstLVType && srcVgName == dstVGName {
+		// special case for clone dm-thin, so activate the target
+		_, err := lvm.CreateSnapshot(dstLV, srcLvName, srcVgName, int64(dstSize), dstLVType, createSnapshotForClone)
+		if err != nil {
+			return fmt.Errorf("unable to create snapshot: %w", err)
+		}
+		klog.Infof("lv: %s/%s cloned from %s", dstVGName, dstLV, srcLvName)
+		return nil
+	}
+
+	// check source dev
+	srcDev := fmt.Sprintf("/dev/%s/%s", srcVgName, srcLvName)
+	src, err := os.OpenFile(srcDev, syscall.O_RDONLY|syscall.O_DIRECT, 0)
+	if err != nil {
+		return fmt.Errorf("unable to open source device: %w", err)
+	}
+	defer src.Close()
 
 	output, err := lvm.CreateLVS(dstVGName, dstLV, dstSize, dstLVType)
 	if err != nil {
