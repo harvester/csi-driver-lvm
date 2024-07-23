@@ -1,0 +1,16 @@
+allowVolumeExpansion: true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lvm-striped
+parameters:
+  type: striped
+  vgName: vg01
+provisioner: lvm.driver.harvesterhci.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowedTopologies:
+- matchLabelExpressions:
+  - key: topology.lvm.csi/node
+    values:
+    - <target node name>
