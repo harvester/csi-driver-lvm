@@ -1,5 +1,5 @@
 
-FROM golang:1.22-bookworm
+FROM golang:1.22.7-bookworm
 
 ARG DAPPER_HOST_ARCH
 ENV HOST_ARCH=${DAPPER_HOST_ARCH} ARCH=${DAPPER_HOST_ARCH}

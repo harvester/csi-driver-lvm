@@ -1,6 +1,6 @@
 module github.com/harvester/csi-driver-lvm
 
-go 1.22.5
+go 1.22.7
 
 require (
 	github.com/container-storage-interface/spec v1.9.0
