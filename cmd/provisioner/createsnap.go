@@ -16,7 +16,7 @@ func createSnapCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  flagSnapName,
-				Usage: "Required. Specify lv name.",
+				Usage: "Required. Specify snapshot name.",
 			},
 			&cli.Int64Flag{
 				Name:  flagLVSize,
@@ -28,7 +28,7 @@ func createSnapCmd() *cli.Command {
 			},
 			&cli.StringFlag{
 				Name:  flagLVName,
-				Usage: "Required. the name of the volumegroup",
+				Usage: "Required. Specify the logical volume name.",
 			},
 			&cli.StringFlag{
 				Name:  flagLVMType,
@@ -60,7 +60,7 @@ func createSnap(c *cli.Context) error {
 	}
 	snapName := c.String(flagSnapName)
 	if snapName == "" {
-		return fmt.Errorf("invalid empty flag %v", flagLVMType)
+		return fmt.Errorf("invalid empty flag %v", flagSnapName)
 	}
 	lvType := c.String(flagLVMType)
 	if lvType == "" {

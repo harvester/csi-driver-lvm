@@ -195,36 +195,27 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}, nil
 }
 
-func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *snapv1.VolumeSnapshotContent, dstName, dstNode, dstLVType, dstVGName string, dstSize int64) error {
-	srcVolID := *snapContent.Spec.Source.VolumeHandle
-	srcVol, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, srcVolID, metav1.GetOptions{})
-	if err != nil {
-		klog.Errorf("error getting volume: %v", err)
-		return err
-	}
+func (cs *controllerServer) generateVolumeActionForClone(srcVol *v1.PersistentVolume, srcLVName, dstName, dstNode, dstLVType, dstVGName string, srcSize, dstSize int64) (volumeAction, error) {
 	ns := srcVol.Spec.NodeAffinity.Required.NodeSelectorTerms
 	srcNode := ns[0].MatchExpressions[0].Values[0]
 	srcVgName := srcVol.Spec.CSI.VolumeAttributes["vgName"]
-	srcVgType := srcVol.Spec.CSI.VolumeAttributes["type"]
-	restoreSize := *snapContent.Status.RestoreSize
+	srcType := srcVol.Spec.CSI.VolumeAttributes["type"]
 
-	snapshotLVName := fmt.Sprintf("lvm-%s", *snapContent.Status.SnapshotHandle)
-	//srcSnapDev := fmt.Sprintf("/dev/%s/%s", srcVgName, snapshotLVName)
 	srcInfo := &srcInfo{
-		srcLVName: snapshotLVName,
+		srcLVName: srcLVName,
 		srcVGName: srcVgName,
-		srcType:   srcVgType,
+		srcType:   srcType,
 	}
-	klog.V(4).Infof("cloning volume from %s/%s ", srcVgName, snapshotLVName)
+	klog.V(4).Infof("cloning volume from %s/%s ", srcVgName, srcLVName)
 
-	if restoreSize > dstSize {
-		return status.Error(codes.InvalidArgument, "source volume size is larger than destination volume size")
+	if srcSize > dstSize {
+		return volumeAction{}, status.Errorf(codes.InvalidArgument, "source/snapshot volume size(%v) is larger than destination volume size(%v)", srcSize, dstSize)
 	}
 	if srcNode != dstNode {
-		return status.Errorf(codes.InvalidArgument, "source (%s) and destination (%s) nodes are different (not supported)", srcNode, dstNode)
+		return volumeAction{}, status.Errorf(codes.InvalidArgument, "source (%s) and destination (%s) nodes are different (not supported)", srcNode, dstNode)
 	}
 
-	va := volumeAction{
+	return volumeAction{
 		action:           actionTypeClone,
 		name:             dstName,
 		nodeName:         dstNode,
@@ -237,7 +228,23 @@ func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *
 		vgName:           dstVGName,
 		hostWritePath:    cs.hostWritePath,
 		srcInfo:          srcInfo,
+	}, nil
+}
+
+func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *snapv1.VolumeSnapshotContent, dstName, dstNode, dstLVType, dstVGName string, dstSize int64) error {
+	srcVolID := *snapContent.Spec.Source.VolumeHandle
+	srcVol, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, srcVolID, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("error getting volume: %v", err)
+		return err
 	}
+	restoreSize := *snapContent.Status.RestoreSize
+	snapshotLVName := fmt.Sprintf("lvm-%s", *snapContent.Status.SnapshotHandle)
+	va, err := cs.generateVolumeActionForClone(srcVol, snapshotLVName, dstName, dstNode, dstLVType, dstVGName, restoreSize, dstSize)
+	if err != nil {
+		return err
+	}
+
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return err
@@ -247,47 +254,17 @@ func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *
 }
 
 func (cs *controllerServer) cloneFromVolume(ctx context.Context, srcVol *v1.PersistentVolume, dstName, dstNode, dstLVType, dstVGName string, dstSize int64) error {
-	ns := srcVol.Spec.NodeAffinity.Required.NodeSelectorTerms
-	srcNode := ns[0].MatchExpressions[0].Values[0]
-	srcVgName := srcVol.Spec.CSI.VolumeAttributes["vgName"]
-	srcType := srcVol.Spec.CSI.VolumeAttributes["type"]
 	srcSizeStr := srcVol.Spec.CSI.VolumeAttributes["RequiredBytes"]
 	srcSize, err := strconv.ParseInt(srcSizeStr, 10, 64)
 	if err != nil {
-		klog.Errorf("error parsing srcSize: %v", err)
+		return status.Errorf(codes.InvalidArgument, "error parsing srcSize: %v", err)
+	}
+	srcLVName := srcVol.GetName()
+	va, err := cs.generateVolumeActionForClone(srcVol, srcLVName, dstName, dstNode, dstLVType, dstVGName, srcSize, dstSize)
+	if err != nil {
 		return err
 	}
 
-	//srcDev := fmt.Sprintf("/dev/%s/%s", srcVgName, srcVol.GetName())
-	srcLVName := srcVol.GetName()
-	srcInfo := &srcInfo{
-		srcLVName: srcLVName,
-		srcVGName: srcVgName,
-		srcType:   srcType,
-	}
-	klog.V(4).Infof("cloning volume from %s/%s ", srcVgName, srcLVName)
-
-	if srcSize > dstSize {
-		return status.Error(codes.InvalidArgument, "source volume size is larger than destination volume size")
-	}
-	if srcNode != dstNode {
-		return status.Errorf(codes.InvalidArgument, "source (%s) and destination (%s) nodes are different (not supported)", srcNode, dstNode)
-	}
-
-	va := volumeAction{
-		action:           actionTypeClone,
-		name:             dstName,
-		nodeName:         dstNode,
-		size:             dstSize,
-		lvmType:          dstLVType,
-		pullPolicy:       cs.pullPolicy,
-		provisionerImage: cs.provisionerImage,
-		kubeClient:       cs.kubeClient,
-		namespace:        cs.namespace,
-		vgName:           dstVGName,
-		hostWritePath:    cs.hostWritePath,
-		srcInfo:          srcInfo,
-	}
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return err

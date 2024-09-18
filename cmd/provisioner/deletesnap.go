@@ -16,7 +16,7 @@ func deleteSnapCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  flagSnapName,
-				Usage: "Required. Specify lv name.",
+				Usage: "Required. Specify snapshot name.",
 			},
 			&cli.StringFlag{
 				Name:  flagVGName,
@@ -40,7 +40,7 @@ func deleteSnap(c *cli.Context) error {
 	}
 	snapName := c.String(flagSnapName)
 	if snapName == "" {
-		return fmt.Errorf("invalid empty flag %v", flagLVMType)
+		return fmt.Errorf("invalid empty flag %v", flagSnapName)
 	}
 
 	klog.Infof("delete snapshot: %s/%s", vgName, snapName)
