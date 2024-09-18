@@ -42,7 +42,7 @@ spec:
         resources: {}
         securityContext:
           privileged: true
-        terminationMessagePath: /dev/termination-log
+        terminationMessagePath: /termination.log
         terminationMessagePolicy: File
         volumeMounts:
         - mountPath: /csi
@@ -54,9 +54,7 @@ spec:
         - --drivername={{ .Values.lvm.driverName }}
         - --endpoint=unix:///csi/csi.sock
         - --hostwritepath={{ .Values.lvm.hostWritePath }}
-        - --devices={{ .Values.lvm.devicePattern }}
         - --nodeid=$(KUBE_NODE_NAME)
-        - --vgname={{ .Values.lvm.vgName }}
         - --namespace={{ .Release.Namespace }}
         - --provisionerimage={{ .Values.provisionerImage.repository }}:{{ .Values.provisionerImage.tag }}
         - --pullpolicy={{ .Values.provisionerImage.pullPolicy }}
@@ -117,7 +115,7 @@ spec:
         image: {{ template "externalImages.csiLivenessprobe" . }}
         imagePullPolicy: IfNotPresent
         resources: {}
-        terminationMessagePath: /dev/termination-log
+        terminationMessagePath: /termination.log
         terminationMessagePolicy: File
         volumeMounts:
         - mountPath: /csi

@@ -9,11 +9,17 @@ import (
 )
 
 const (
-	flagLVName         = "lvname"
-	flagLVSize         = "lvsize"
-	flagVGName         = "vgname"
-	flagDevicesPattern = "devices"
-	flagLVMType        = "lvmtype"
+	flagLVName             = "lvname"
+	flagLVSize             = "lvsize"
+	flagVGName             = "vgname"
+	flagDevicesPattern     = "devices"
+	flagLVMType            = "lvmtype"
+	flagSnapName           = "snapname"
+	flagSrcLVName          = "srclvname"
+	flagSrcVGName          = "srcvgname"
+	flagSrcType            = "srctype"
+	createSnapshotForClone = true
+	snapshotPrefix         = "lvm-snapshot-"
 )
 
 func cmdNotFound(c *cli.Context, command string) {
@@ -30,6 +36,9 @@ func main() {
 	p.Commands = []*cli.Command{
 		createLVCmd(),
 		deleteLVCmd(),
+		createSnapCmd(),
+		deleteSnapCmd(),
+		cloneLVCmd(),
 	}
 	p.CommandNotFound = cmdNotFound
 	p.OnUsageError = onUsageError

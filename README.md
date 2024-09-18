@@ -1,82 +1,65 @@
-# csi-driver-lvm #
+# Harvester-csi-driver-lvm
 
-CSI DRIVER LVM utilizes local storage of Kubernetes nodes to provide persistent storage for pods.
+Harvester-CSI-Driver-LVM is derived from [metal-stack/csi-driver-lvm](https://github.com/metal-stack/csi-driver-lvm).
 
-It automatically creates hostPath based persistent volumes on the nodes.
+## Introduction
 
-Underneath it creates a LVM logical volume on the local disks. A comma-separated list of grok pattern, which disks to use must be specified.
+Harvester-CSI-Driver-LVM utilizes local storage to provide persistent storage for workloads (Usually VM workloads). It will make the VM unable to be migrated to other nodes, but it can provide better performance.
 
-This CSI driver is derived from [csi-driver-host-path](https://github.com/kubernetes-csi/csi-driver-host-path) and [csi-lvm](https://github.com/metal-stack/csi-lvm)
+Before you use it, you should have the pre-established Volume Group (VG) on that node. The VG name will be specified in the StorageClass.
 
-## Currently it can create, delete, mount, unmount and resize block and filesystem volumes via lvm ##
+The Harvester-CSI-Driver-LVM provides the following features:
+- OnDemand Creation of Logical Volume (LV).
+- Support LVM type Striped and DM-Thin.
+- Support for Raw Block Volume.
+- Support Volume Expansion.
+- Support Volume Snapshot.
+- Support Volume Clone.
 
-For the special case of block volumes, the filesystem-expansion has to be performed by the app using the block device
+**NOTE**: The Snapshot/Clone feature only works on the same nodes. Clone works for different Volume Groups.
 
 ## Installation ##
 
-**Helm charts for installation are located in a separate repository called [helm-charts](https://github.com/metal-stack/helm-charts). If you would like to contribute to the helm chart, please raise an issue or pull request there.**
+You can use Helm to install the Harvester-CSI-Driver-LVM by remote repo or local helm chart files.
 
-You have to set the devicePattern for your hardware to specify which disks should be used to create the volume group.
+1. Install the Harvester-CSI-Driver-LVM locally:
 
-```bash
-helm install --repo https://helm.metal-stack.io mytest helm/csi-driver-lvm --set lvm.devicePattern='/dev/nvme[0-9]n[0-9]'
+```
+$ git clone https://github.com/harvester/csi-driver-lvm.git
+$ cd csi-driver-lvm/deploy
+$ helm install harvester-lvm-csi-driver charts/ -n harvester-system
 ```
 
-Now you can use one of following storageClasses:
+2. Install the Harvester-CSI-Driver-LVM by remote repo:
 
-* `csi-driver-lvm-linear`
-* `csi-driver-lvm-mirror`
-* `csi-driver-lvm-striped`
+```
+$ helm repo add harvester https://charts.harvesterhci.io
+$ helm install harvester/harvester-lvm-csi-driver -n harvester-system
+```
 
-To get the previous old and now deprecated `csi-lvm-sc-linear`, ... storageclasses, set helm-chart value `compat03x=true`.
+After the installation, you can check the status of the following pods:
+```
+$ kubectl get pods -A |grep harvester-csi-driver-lvm
+harvester-system                  harvester-csi-driver-lvm-controller-0                   4/4     Running     0               3h2m
+harvester-system                  harvester-csi-driver-lvm-plugin-ctlgp                   3/3     Running     1 (14h ago)     14h
+harvester-system                  harvester-csi-driver-lvm-plugin-qxxqs                   3/3     Running     1 (14h ago)     14h
+harvester-system                  harvester-csi-driver-lvm-plugin-xktx2                   3/3     Running     0               14h
+```
 
-## Migration ##
+The CSI driver will be installed in the `harvester-system` namespace and provision to each node.
 
-If you want to migrate your existing PVC to / from csi-driver-lvm, you can use [korb](https://github.com/BeryJu/korb).
+After installation, you can refer to the `examples` directory for some example CRDs for usage.
 
 ### Todo ###
 
-* implement CreateSnapshot(), ListSnapshots(), DeleteSnapshot()
+* Implement the unittest
+* Implement the webhook for the validation
 
+### HowTo Build
 
-### Test ###
-
-```bash
-kubectl apply -f examples/csi-pvc-raw.yaml
-kubectl apply -f examples/csi-pod-raw.yaml
-
-
-kubectl apply -f examples/csi-pvc.yaml
-kubectl apply -f examples/csi-app.yaml
-
-kubectl delete -f examples/csi-pod-raw.yaml
-kubectl delete -f examples/csi-pvc-raw.yaml
-
-kubectl delete -f  examples/csi-app.yaml
-kubectl delete -f examples/csi-pvc.yaml
+```
+$ make
 ```
 
-### Development ###
-
-In order to run the integration tests locally, you need to create to loop devices on your host machine. Make sure the loop device mount paths are not used on your system (default path is `/dev/loop10{0,1}`).
-
-You can create these loop devices like this:
-
-```bash
-for i in 100 101; do fallocate -l 1G loop${i}.img ; sudo losetup /dev/loop${i} loop${i}.img; done
-sudo losetup -a
-# use this for recreation or cleanup
-# for i in 100 101; do sudo losetup -d /dev/loop${i}; rm -f loop${i}.img; done
-```
-
-You can then run the tests against a kind cluster, running:
-
-```bash
-make test
-```
-
-To recreate or cleanup the kind cluster:
-
-```bash
-make test-cleanup
-```
+The above command will execute the validation and build the target Image.
+You can define your REPO and TAG with ENV `REPO` and `TAG`.
