@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+source $(dirname $0)/version
+
+cd $(dirname $0)/..
+
+IMAGE=${REPO}/harvester-lvm-csi-driver-webhook:${TAG}
+DOCKERFILE=package/Dockerfile.webhook
+if [ -e ${DOCKERFILE}.${ARCH} ]; then
+    DOCKERFILE=${DOCKERFILE}.${ARCH}
+fi
+
+buildx build --load -f ${DOCKERFILE} -t ${IMAGE} .
+echo Built ${IMAGE}

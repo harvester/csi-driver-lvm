@@ -12,6 +12,7 @@ env:
   repo: "rancher"
   provisionerImageName: "harvester-lvm-provisioner"
   pluginImageName: "harvester-lvm-csi-plugin"
+  webhookImageName: "harvester-lvm-csi-driver-webhook"
 
 jobs:
   dapper-build:
@@ -65,3 +66,13 @@ jobs:
         file: package/Dockerfile.provisioner
         push: ${{ inputs.push }}
         tags: ${{ env.repo }}/${{ env.provisionerImageName }}:${{ inputs.tag }}
+
+    - name: Docker Build (LVM Webhook)
+      uses: docker/build-push-action@v5
+      with:
+        provenance: false
+        context: .
+        platforms: linux/amd64,linux/arm64
+        file: package/Dockerfile.webhook
+        push: ${{ inputs.push }}
+        tags: ${{ env.repo }}/${{ env.webhookImageName }}:${{ inputs.tag }}

@@ -24,4 +24,5 @@ for arch in "amd64" "arm64"; do
     fi
     GOARCH="$arch" CGO_ENABLED=1 CC=$CC CGO_CFLAGS=$CGO_CFLAGS CGO_LDFLAGS=$CGO_LDFLAGS go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/lvmplugin-"$arch"
     GOARCH="$arch" CGO_ENABLED=1 CC=$CC CGO_CFLAGS=$CGO_CFLAGS CGO_LDFLAGS=$CGO_LDFLAGS go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-lvmplugin-provisioner-"$arch" cmd/provisioner/*.go
+    GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-driver-lvm-webhook-"$arch" cmd/webhook/*.go
 done
