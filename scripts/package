@@ -3,3 +3,4 @@ set -e
 
 ./package_lvmplugin
 ./package_lvm_provisioner
+./package_lvm_webhook

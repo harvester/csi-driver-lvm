@@ -14,12 +14,23 @@ provisionerImage:
   # Overrides the image tag whose default is the chart appVersion.
   tag: "main-head"
 
+nameOverride: ""
+
 lvm:
   # You will want to change this for read-only filesystems
   # For example, in Talos OS, set this to "/var/etc/lvm"
   hostWritePath: /etc/lvm
 
   driverName: lvm.driver.harvesterhci.io
+
+webhook:
+  replicas: 1
+  image:
+    repository: rancher/harvester-lvm-csi-driver-webhook
+    pullPolicy: IfNotPresent
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: "main-head"
+  httpsPort: 8443
 
 rbac:
   create: true
@@ -87,3 +98,11 @@ tolerations:
   # - key: node-role.kubernetes.io/control-plane
   #   operator: Exists
   #   effect: NoSchedule
+  webhook:
+  # - key: node-role.kubernetes.io/master
+  #   operator: Exists
+  #   effect: NoSchedule
+  # - key: node-role.kubernetes.io/control-plane
+  #   operator: Exists
+  #   effect: NoSchedule
+  
