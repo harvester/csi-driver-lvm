@@ -5,17 +5,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "harvester-csi-driver-lvm-webhook.labels" . | nindent 4 }}
-  {{- if .Values.webhook.replicas }}
-  # The annotation does not support 0 replicas.
-  annotations:
-    management.cattle.io/scale-available: "{{ .Values.webhook.replicas }}"
-  {{- end }}
   name: harvester-csi-driver-lvm-webhook
 spec:
-  {{- if not .Values.webhook.replicas }}
-  # Use this field instead of the scale-available annotation when it is 0 replicas.
   replicas: {{ .Values.webhook.replicas }}
-  {{- end }}
   selector:
     matchLabels:
       {{- include "harvester-csi-driver-lvm-webhook.selectorLabels" . | nindent 6 }}
