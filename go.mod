@@ -10,10 +10,9 @@ replace (
 require (
 	github.com/container-storage-interface/spec v1.9.0
 	github.com/harvester/go-common v0.0.0-20240903083523-9576346cda75
-	github.com/harvester/webhook v0.1.4
+	github.com/harvester/webhook v0.1.5
 	github.com/kubernetes-csi/csi-lib-utils v0.18.1
 	github.com/kubernetes-csi/external-snapshotter/client/v8 v8.0.0
-	github.com/rancher/wrangler v1.1.2
 	github.com/rancher/wrangler/v3 v3.0.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/urfave/cli/v2 v2.27.2
@@ -60,7 +59,7 @@ require (
 	github.com/prometheus/client_model v0.4.1-0.20230718164431-9a2bf3000d16 // indirect
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
-	github.com/rancher/dynamiclistener v0.3.6 // indirect
+	github.com/rancher/dynamiclistener v0.6.0 // indirect
 	github.com/rancher/lasso v0.0.0-20240705194423-b2a060d103c1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect

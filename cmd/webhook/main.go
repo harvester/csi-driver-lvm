@@ -7,7 +7,7 @@ import (
 	"github.com/harvester/webhook/pkg/config"
 	"github.com/harvester/webhook/pkg/server"
 	"github.com/harvester/webhook/pkg/server/admission"
-	"github.com/rancher/wrangler/pkg/generated/controllers/core"
+	"github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
 	ctlstorage "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage"
 	"github.com/rancher/wrangler/v3/pkg/kubeconfig"
 	"github.com/rancher/wrangler/v3/pkg/signals"
