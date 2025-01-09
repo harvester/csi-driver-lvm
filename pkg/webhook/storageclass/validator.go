@@ -109,13 +109,14 @@ func (v *Validator) validateUniqueVGType(obj runtime.Object) error {
 	}
 	for _, storageClass := range scList.Items {
 		klog.Infof("Checking the SC: %v", storageClass)
+		scCpy := storageClass.DeepCopy()
 		if storageClass.Provisioner != utils.LVMCSIDriver {
 			continue
 		}
 		if storageClass.Name == sc.Name {
 			continue
 		}
-		targetNode := getLVMTopologyNodes(&storageClass)
+		targetNode := getLVMTopologyNodes(scCpy)
 		if targetNode != creatingNodeName {
 			continue
 		}
