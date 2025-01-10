@@ -1,6 +1,6 @@
 module github.com/harvester/csi-driver-lvm
 
-go 1.22.7
+go 1.23
 
 replace (
 	github.com/googleapis/gnostic => github.com/googleapis/gnostic v0.3.1

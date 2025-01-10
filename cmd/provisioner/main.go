@@ -22,11 +22,11 @@ const (
 	snapshotPrefix         = "lvm-snapshot-"
 )
 
-func cmdNotFound(c *cli.Context, command string) {
+func cmdNotFound(_ *cli.Context, command string) {
 	panic(fmt.Errorf("unrecognized command: %s", command))
 }
 
-func onUsageError(c *cli.Context, err error, isSubcommand bool) error {
+func onUsageError(_ *cli.Context, _ error, _ bool) error {
 	panic(fmt.Errorf("usage error, please check your command"))
 }
 
