@@ -204,11 +204,11 @@ func (ns *nodeServer) NodeGetVolumeStats(_ context.Context, in *csi.NodeGetVolum
 		return nil, err
 	}
 
-	diskFree := int64(fs.Bfree) * int64(fs.Bsize)
-	diskTotal := int64(fs.Blocks) * int64(fs.Bsize)
+	diskFree := int64(fs.Bfree) * int64(fs.Bsize)   //nolint:gosec
+	diskTotal := int64(fs.Blocks) * int64(fs.Bsize) //nolint:gosec
 
-	inodesFree := int64(fs.Ffree)
-	inodesTotal := int64(fs.Files)
+	inodesFree := int64(fs.Ffree)  //nolint:gosec
+	inodesTotal := int64(fs.Files) //nolint:gosec
 
 	return &csi.NodeGetVolumeStatsResponse{
 		Usage: []*csi.VolumeUsage{
@@ -258,7 +258,7 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		isBlock = true
 	}
 
-	output, err := extendLVS(volID, uint64(capacity), isBlock)
+	output, err := extendLVS(volID, uint64(capacity), isBlock) //nolint:gosec
 
 	if err != nil {
 		return nil, fmt.Errorf("unable to umount lv: %w output:%s", err, output)
