@@ -99,7 +99,7 @@ func clonelv(c *cli.Context) error {
 	klog.Infof("clone lv %s, vg: %s, type: %s", srcLvName, srcVgName, srcType)
 	if strings.HasPrefix(srcLvName, snapshotPrefix) && srcType == lvm.DmThinType && srcType == dstLVType && srcVgName == dstVGName {
 		// special case for clone dm-thin, so activate the target
-		_, err := lvm.CreateSnapshot(dstLV, srcLvName, srcVgName, int64(dstSize), dstLVType, createSnapshotForClone)
+		_, err := lvm.CreateSnapshot(dstLV, srcLvName, srcVgName, int64(dstSize), dstLVType, createSnapshotForClone) //nolint:gosec
 		if err != nil {
 			return fmt.Errorf("unable to create snapshot: %w", err)
 		}
