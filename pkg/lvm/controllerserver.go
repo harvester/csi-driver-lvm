@@ -116,7 +116,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	lvmType := req.GetParameters()["type"]
-	if !(lvmType == "striped" || lvmType == "dm-thin") {
+	if lvmType != "striped" && lvmType != "dm-thin" {
 		return nil, status.Errorf(codes.Internal, "lvmType is incorrect: %s", lvmType)
 	}
 

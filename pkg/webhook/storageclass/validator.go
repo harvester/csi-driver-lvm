@@ -53,7 +53,7 @@ func (v *Validator) validateTopologyNodes(obj runtime.Object) error {
 	if sc.Provisioner != utils.LVMCSIDriver {
 		return nil
 	}
-	if sc.AllowedTopologies == nil || len(sc.AllowedTopologies) == 0 {
+	if len(sc.AllowedTopologies) == 0 {
 		return fmt.Errorf("storageclass %s with provisioner %s must have allowedTopologies", sc.Name, sc.Provisioner)
 	}
 	nodes, err := v.nodeCtrl.List(metav1.ListOptions{})
@@ -66,7 +66,7 @@ func (v *Validator) validateTopologyNodes(obj runtime.Object) error {
 	}
 	foundMatchTopologyKey := false
 	for _, topology := range sc.AllowedTopologies {
-		if topology.MatchLabelExpressions == nil || len(topology.MatchLabelExpressions) == 0 {
+		if len(topology.MatchLabelExpressions) == 0 {
 			return fmt.Errorf("storageclass %s with provisioner %s must have MatchLabelExpressions in allowedTopologies", sc.Name, sc.Provisioner)
 		}
 		for _, matchLabel := range topology.MatchLabelExpressions {
