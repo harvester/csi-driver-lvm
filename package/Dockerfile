@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7.0
 
-FROM registry.suse.com/bci/bci-base:15.6
+FROM registry.suse.com/bci/bci-base:15.7
 
 RUN zypper -n rm container-suseconnect && \
     zypper -n install util-linux-systemd lvm2 e2fsprogs nvme-cli device-mapper xfsprogs && \
