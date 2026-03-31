@@ -19,8 +19,6 @@ for arch in "amd64" "arm64"; do
     CGO_LDFLAGS=""
     if [ "$arch" = "arm64" ]; then
         CC="aarch64-linux-gnu-gcc-11"
-        CGO_CFLAGS="-g -O2 -I/usr/include --sysroot /usr/aarch64-linux-gnu/"
-        CGO_LDFLAGS="--sysroot /usr/aarch64-linux-gnu/"
     fi
     GOARCH="$arch" CGO_ENABLED=1 CC=$CC CGO_CFLAGS=$CGO_CFLAGS CGO_LDFLAGS=$CGO_LDFLAGS go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/lvmplugin-"$arch"
     GOARCH="$arch" CGO_ENABLED=1 CC=$CC CGO_CFLAGS=$CGO_CFLAGS CGO_LDFLAGS=$CGO_LDFLAGS go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-lvmplugin-provisioner-"$arch" cmd/provisioner/*.go

@@ -4,22 +4,31 @@ FROM golang:1.25.7-bookworm
 ARG DAPPER_HOST_ARCH
 ENV HOST_ARCH=${DAPPER_HOST_ARCH} ARCH=${DAPPER_HOST_ARCH}
 
-RUN apt update
-RUN apt install -y git curl gzip tar gawk docker wget make binutils gcc linux-libc-dev gcc-11-aarch64-linux-gnu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    gzip \
+    tar \
+    gawk \
+    docker.io \
+    wget \
+    make \
+    binutils \
+    gcc \
+    linux-libc-dev \
+    linux-libc-dev-arm64-cross \
+    libc6-dev-arm64-cross \
+    gcc-11-aarch64-linux-gnu \
+    && rm -rf /var/lib/apt/lists/*
 
 ## install golangci
-RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s latest
+COPY --from=golangci/golangci-lint:v2.11.4-alpine@sha256:72bcd68512b4e27540dd3a778a1b7afd45759d8145cfb3c089f1d7af53e718e9 /usr/bin/golangci-lint /usr/local/bin/golangci-lint
 
-# The docker version in dapper is too old to have buildx. Install it manually.
-RUN curl -sSfL https://github.com/docker/buildx/releases/download/v0.13.1/buildx-v0.13.1.linux-${ARCH} -o buildx-v0.13.1.linux-${ARCH} && \
-    chmod +x buildx-v0.13.1.linux-${ARCH} && \
-    mv buildx-v0.13.1.linux-${ARCH} /usr/local/bin/buildx
-
-ENV DAPPER_ENV REPO TAG
-ENV DAPPER_SOURCE /go/src/github.com/harvester/csi-driver-lvm
-ENV DAPPER_OUTPUT ./bin
-ENV DAPPER_DOCKER_SOCKET true
-ENV HOME ${DAPPER_SOURCE}
+ENV DAPPER_ENV="REPO TAG"
+ENV DAPPER_SOURCE=/go/src/github.com/harvester/csi-driver-lvm
+ENV DAPPER_OUTPUT=./bin
+ENV DAPPER_DOCKER_SOCKET=true
+ENV HOME=${DAPPER_SOURCE}
 WORKDIR ${DAPPER_SOURCE}
 
 ENTRYPOINT ["./scripts/entry"]
