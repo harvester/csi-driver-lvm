@@ -11,5 +11,9 @@ if [ -e ${DOCKERFILE}.${ARCH} ]; then
     DOCKERFILE=${DOCKERFILE}.${ARCH}
 fi
 
-buildx build --load -f ${DOCKERFILE} -t ${IMAGE} .
+if docker buildx version >/dev/null 2>&1; then
+    docker buildx build --load -f ${DOCKERFILE} -t ${IMAGE} .
+else
+    docker build -f ${DOCKERFILE} -t ${IMAGE} .
+fi
 echo Built ${IMAGE}
