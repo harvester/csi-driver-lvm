@@ -382,7 +382,7 @@ func (cs *controllerServer) validateControllerServiceRequest(c csi.ControllerSer
 }
 
 func getControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) []*csi.ControllerServiceCapability {
-	var csc = make([]*csi.ControllerServiceCapability, len(cl))
+	var csc = make([]*csi.ControllerServiceCapability, 0, len(cl))
 
 	for _, cap := range cl {
 		klog.Infof("Enabling controller service capability: %v", cap.String())
