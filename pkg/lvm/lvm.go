@@ -549,7 +549,8 @@ func RemoveLVS(name string) (string, error) {
 	}
 
 	executor := cmd.NewExecutor()
-	args := []string{"-q", "-y"}
+	args := make([]string, 0, 3)
+	args = append(args, "-q", "-y")
 	args = append(args, fmt.Sprintf("%s/%s", vgName, name))
 	klog.Infof("lvremove %s", args)
 	out, err := executor.Execute("lvremove", args)
@@ -603,7 +604,8 @@ func DeleteSnapshot(snapshotName, vgName string) (string, error) {
 	// Names starting "snapshot" are reserved for internal use by LVM
 	// we patch new snapName as "lvm-<snapshotName>"
 	snapshotName = fmt.Sprintf("lvm-%s", snapshotName)
-	args := []string{"-q", "-y"}
+	args := make([]string, 0, 3)
+	args = append(args, "-q", "-y")
 	args = append(args, fmt.Sprintf("/dev/%s/%s", vgName, snapshotName))
 	klog.Infof("lvremove %s", args)
 	out, err := executor.Execute("lvremove", args)
@@ -744,7 +746,8 @@ func getLVSize(lvName, vgName string) (uint64, error) {
 	executor := cmd.NewExecutor()
 	targetLVName := fmt.Sprintf("%s/%s", vgName, lvName)
 	// check current lv size
-	args := []string{"--noheadings", "--unit", "b", "-o", "Size"}
+	args := make([]string, 0, 6)
+	args = append(args, "--noheadings", "--unit", "b", "-o", "Size")
 	args = append(args, targetLVName)
 	out, err := executor.Execute("lvs", args)
 	if err != nil {
