@@ -1,8 +1,0 @@
-#!/bin/bash
-set -e
-
-SCRIPT_DIR=$(dirname "$0")
-
-"${SCRIPT_DIR}/package_lvmplugin"
-"${SCRIPT_DIR}/package_lvm_provisioner"
-"${SCRIPT_DIR}/package_lvm_webhook"
