@@ -1,2 +1,11 @@
+# git dir is excluded to avoid passing the entire git object database through
+# the build context; stages that need git use git-init inside the stage.
+.git
+
 ./.dapper
-./.cache
+/.cache
+*.swp
+.idea/
+
+# /bin is intentionally NOT excluded because `make package-*` targets use the
+# project root as docker build context and the package Dockerfiles do COPY bin/...
