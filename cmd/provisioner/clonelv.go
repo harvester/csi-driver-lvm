@@ -115,7 +115,11 @@ func clonelv(c *cli.Context) error {
 	}
 	defer src.Close()
 
-	output, err := lvm.CreateLVS(dstVGName, dstLV, dstSize, dstLVType)
+	// Clone always targets an existing thin pool (created earlier by the first
+	// non-clone PVC on this VG). Pass empty strings for the pool-creation
+	// parameters - CreateLVS will skip the lvcreate --thinpool call entirely
+	// once it detects the pool already exists.
+	output, err := lvm.CreateLVS(dstVGName, dstLV, dstSize, dstLVType, "", "", "")
 	if err != nil {
 		return fmt.Errorf("unable to create lv: %w output:%s", err, output)
 	}

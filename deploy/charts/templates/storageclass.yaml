@@ -1,0 +1,55 @@
+{{- /*
+Render StorageClasses declared in values.yaml under `storageClasses:`.
+
+Each key under storageClasses may specify:
+  enabled              (bool)   whether to render this StorageClass
+  type                 (string) LVM type: "dm-thin" or "striped"
+  chunkSize            (string) thin-pool --chunksize (dm-thin only, first-PVC only)
+  poolMetadataSize     (string) thin-pool --poolmetadatasize (dm-thin only, first-PVC only)
+  zeroBlocks           (string) "true" or "false" (dm-thin only, first-PVC only)
+  reclaimPolicy        (string) Delete or Retain (default Delete)
+  volumeBindingMode    (string) WaitForFirstConsumer or Immediate (default WaitForFirstConsumer)
+  allowVolumeExpansion (bool)   default true
+  vgName               (string) optional; if unset, users must set it per-namespace via UI or by editing the SC
+
+Only "type" is strictly required to render.
+
+Note: chunk_size CANNOT be changed after the thin pool is created. Pick the
+right value before workloads start writing. See docs/advanced/addons/lvm-local-storage.md.
+*/ -}}
+
+{{- range $name, $sc := .Values.storageClasses }}
+{{- if $sc.enabled }}
+{{- if $sc.type }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ $name }}
+  {{- with $sc.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+provisioner: {{ $.Values.lvm.driverName }}
+parameters:
+  type: {{ $sc.type | quote }}
+  {{- if $sc.vgName }}
+  vgName: {{ $sc.vgName | quote }}
+  {{- end }}
+  {{- if eq $sc.type "dm-thin" }}
+  {{- if $sc.chunkSize }}
+  chunkSize: {{ $sc.chunkSize | quote }}
+  {{- end }}
+  {{- if $sc.poolMetadataSize }}
+  poolMetadataSize: {{ $sc.poolMetadataSize | quote }}
+  {{- end }}
+  {{- if hasKey $sc "zeroBlocks" }}
+  zeroBlocks: {{ $sc.zeroBlocks | quote }}
+  {{- end }}
+  {{- end }}
+reclaimPolicy: {{ default "Delete" $sc.reclaimPolicy }}
+volumeBindingMode: {{ default "WaitForFirstConsumer" $sc.volumeBindingMode }}
+allowVolumeExpansion: {{ default true $sc.allowVolumeExpansion }}
+{{- end }}
+{{- end }}
+{{- end }}

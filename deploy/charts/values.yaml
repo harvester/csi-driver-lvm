@@ -39,18 +39,63 @@ kubernetes:
   kubeletPath: /var/lib/kubelet
 
 storageClasses:
-  linear:
+  # harvester-lvm-thin: dm-thin (thin-provisioned) pool. Recommended default
+  # for VM workloads. Snapshot-friendly, over-provisions physical space.
+  #
+  # chunkSize, poolMetadataSize, and zeroBlocks are honored ONLY on the very
+  # first PVC that causes the pool to be created. They CANNOT be changed
+  # after the pool exists - destroying and recreating the pool is the only
+  # way to change them. Defaults chosen per LVM upstream `performance`
+  # policy and Linux dm-thin admin guide guidance. See
+  # docs/advanced/addons/lvm-local-storage.md for the full rationale.
+  harvester-lvm-thin:
     enabled: true
+    type: dm-thin
+    # 512K matches LVM's upstream `performance` policy seed and the kernel
+    # dm-thin admin guide's general-purpose recommendation. Good up to 128TB
+    # pools. Override to 128K for snapshot-heavy tenants (halves CoW cost).
+    # Never exceed 2M (Red Hat Gluster's documented CoW-friendliness cap).
+    chunkSize: "512K"
+    # 16G covers pools up to 128TB at 512K chunks with headroom. Formula:
+    # metadata_bytes = 64 * (pool_size / chunk_size).
+    poolMetadataSize: "16G"
+    # "false" adds --zero n at pool creation, disabling per-chunk zeroing on
+    # allocation. Recommended for single-tenant clusters; halves write
+    # amplification on first writes to unallocated regions.
+    zeroBlocks: "false"
     additionalAnnotations: []
     # this might be used to mark one of the StorageClasses as default:
     # storageclass.kubernetes.io/is-default-class: "true"
     reclaimPolicy: Delete
-  striped:
+    volumeBindingMode: WaitForFirstConsumer
+    allowVolumeExpansion: true
+  # harvester-lvm-striped: striped (fat-provisioned) volumes. Each PVC
+  # allocates its full requested capacity up front. No thin-pool involved,
+  # so chunkSize/poolMetadataSize/zeroBlocks do not apply.
+  harvester-lvm-striped:
     enabled: true
+    type: striped
+    additionalAnnotations: []
+    reclaimPolicy: Delete
+    volumeBindingMode: WaitForFirstConsumer
+    allowVolumeExpansion: true
+
+  # Legacy keys - retained for backwards compatibility with charts that
+  # were referencing them by name. Left disabled by default; the two entries
+  # above are the recommended way to consume this chart going forward.
+  linear:
+    enabled: false
+    type: striped
+    additionalAnnotations: []
+    reclaimPolicy: Delete
+  striped:
+    enabled: false
+    type: striped
     additionalAnnotations: []
     reclaimPolicy: Delete
   mirror:
-    enabled: true
+    enabled: false
+    type: striped
     additionalAnnotations: []
     reclaimPolicy: Delete
 

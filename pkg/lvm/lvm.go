@@ -80,6 +80,12 @@ type volumeAction struct {
 	vgName           string
 	hostWritePath    string
 	srcInfo          *srcInfo
+	// Thin-pool creation parameters. Only used on the very first PVC that
+	// causes the pool to be created; ignored on subsequent PVCs against the
+	// same pool. Empty values fall back to LVM's built-in defaults.
+	chunkSize        string
+	poolMetadataSize string
+	zeroBlocks       string
 	//srcDev           string
 }
 
@@ -353,6 +359,15 @@ func createProvisionerPod(ctx context.Context, va volumeAction) (err error) {
 	switch va.action {
 	case actionTypeCreate:
 		args = append(args, "createlv", "--lvsize", fmt.Sprintf("%d", va.size), "--lvmtype", va.lvmType, "--vgname", va.vgName)
+		if va.chunkSize != "" {
+			args = append(args, "--chunksize", va.chunkSize)
+		}
+		if va.poolMetadataSize != "" {
+			args = append(args, "--poolmetadatasize", va.poolMetadataSize)
+		}
+		if va.zeroBlocks != "" {
+			args = append(args, "--zeroblocks", va.zeroBlocks)
+		}
 	case actionTypeDelete:
 		args = append(args, "deletelv", "--srcvgname", va.srcInfo.srcVGName, "--srctype", va.srcInfo.srcType)
 	case actionTypeClone:
@@ -434,8 +449,39 @@ func VgActivate() {
 	}
 }
 
-// CreateLVS creates the new volume, used by lvcreate provisioner pod
-func CreateLVS(vg string, name string, size uint64, lvmType string) (string, error) {
+// buildThinPoolCreateArgs assembles the lvcreate command line for a first-time
+// thin-pool creation. Any argument passed as an empty string is omitted so LVM
+// falls back to its built-in default for that flag. zeroBlocks accepts "true"
+// or "false" (case-insensitive) and is translated to lvcreate's "--zero y|n".
+func buildThinPoolCreateArgs(vg, thinPoolName, chunkSize, poolMetadataSize, zeroBlocks string) []string {
+	args := []string{"-l90%FREE", "--thinpool", thinPoolName}
+	if chunkSize != "" {
+		args = append(args, "--chunksize", chunkSize)
+	}
+	if poolMetadataSize != "" {
+		args = append(args, "--poolmetadatasize", poolMetadataSize)
+	}
+	if zeroBlocks != "" {
+		zeroFlag := "y"
+		if strings.EqualFold(zeroBlocks, "false") {
+			zeroFlag = "n"
+		}
+		args = append(args, "--zero", zeroFlag)
+	}
+	args = append(args, vg)
+	return args
+}
+
+// CreateLVS creates the new volume, used by lvcreate provisioner pod.
+//
+// chunkSize, poolMetadataSize, and zeroBlocks apply only when the thin pool is
+// being created for the first time (lvmType == dm-thin and the pool does not
+// yet exist). Empty strings leave the corresponding lvcreate flag unset so LVM
+// falls back to its built-in defaults - which is undesirable for chunk_size on
+// large pools (LVM auto-selects 8-16 MiB for multi-TB pools, causing severe
+// write amplification on random 4K workloads). Callers should pass explicit
+// values from the StorageClass parameters.
+func CreateLVS(vg, name string, size uint64, lvmType, chunkSize, poolMetadataSize, zeroBlocks string) (string, error) {
 
 	if lvExists(vg, name) {
 		klog.Infof("logicalvolume: %s already exists\n", name)
@@ -458,7 +504,7 @@ func CreateLVS(vg string, name string, size uint64, lvmType string) (string, err
 			return "", fmt.Errorf("unable to determine if thinpool exists: %w", err)
 		}
 		if !found {
-			args := []string{"-l90%FREE", "--thinpool", thinPoolName, vg}
+			args := buildThinPoolCreateArgs(vg, thinPoolName, chunkSize, poolMetadataSize, zeroBlocks)
 			klog.Infof("lvcreate %s", args)
 			_, err := executor.Execute("lvcreate", args)
 			if err != nil {
