@@ -26,13 +26,13 @@ func TestBuildThinPoolCreateArgs(t *testing.T) {
 			want:      []string{"-l90%FREE", "--thinpool", pool, "--chunksize", "512K", vg},
 		},
 		{
-			name:             "chart defaults - 512K chunks, 16G metadata, no zeroing",
-			chunkSize:        "512K",
+			name:             "chart defaults - 1M chunks, 16G metadata, no zeroing",
+			chunkSize:        "1M",
 			poolMetadataSize: "16G",
 			zeroBlocks:       "false",
 			want: []string{
 				"-l90%FREE", "--thinpool", pool,
-				"--chunksize", "512K",
+				"--chunksize", "1M",
 				"--poolmetadatasize", "16G",
 				"--zero", "n",
 				vg,

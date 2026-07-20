@@ -45,18 +45,19 @@ storageClasses:
   # chunkSize, poolMetadataSize, and zeroBlocks are honored ONLY on the very
   # first PVC that causes the pool to be created. They CANNOT be changed
   # after the pool exists - destroying and recreating the pool is the only
-  # way to change them. Defaults chosen per LVM upstream `performance`
-  # policy and Linux dm-thin admin guide guidance. See
-  # docs/advanced/addons/lvm-local-storage.md for the full rationale.
+  # way to change them. Defaults chosen to align with the full-stripe width
+  # of common hardware-RAID layouts (see
+  # docs/advanced/addons/lvm-local-storage.md for the full rationale).
   harvester-lvm-thin:
     enabled: true
     type: dm-thin
-    # 512K matches LVM's upstream `performance` policy seed and the kernel
-    # dm-thin admin guide's general-purpose recommendation. Good up to 128TB
-    # pools. Override to 128K for snapshot-heavy tenants (halves CoW cost).
-    # Never exceed 2M (Red Hat Gluster's documented CoW-friendliness cap).
-    chunkSize: "512K"
-    # 16G covers pools up to 128TB at 512K chunks with headroom. Formula:
+    # 1M aligns with the full-stripe width of common hardware-RAID layouts
+    # (e.g. 4 data disks x 256K strip = 1M stripe), so each chunk allocation
+    # maps to whole stripes and avoids partial-stripe read-modify-write. A
+    # sub-stripe chunk (e.g. 512K on a 1M stripe) also widens the RAID5/6
+    # write hole. Override to your RAID full-stripe width; never exceed 2M.
+    chunkSize: "1M"
+    # 16G covers pools up to 256TB at 1M chunks with headroom. Formula:
     # metadata_bytes = 64 * (pool_size / chunk_size).
     poolMetadataSize: "16G"
     # "false" adds --zero n at pool creation, disabling per-chunk zeroing on

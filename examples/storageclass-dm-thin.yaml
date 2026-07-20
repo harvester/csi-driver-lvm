@@ -12,9 +12,9 @@ parameters:
   #
   # See https://docs.harvesterhci.io/latest/advanced/addons/lvm-local-storage
   # for the full rationale and tuning guidance.
-  chunkSize: "512K"          # LVM upstream `performance` policy seed.
-                             # 128K for snapshot-heavy tenants. Never >2M.
-  poolMetadataSize: "16G"    # covers pools up to ~128TB at 512K chunks
+  chunkSize: "1M"            # Align to RAID full-stripe width (data disks x
+                             # strip); 1M suits common layouts. Never >2M.
+  poolMetadataSize: "16G"    # covers pools up to ~256TB at 1M chunks
   zeroBlocks: "false"        # single-tenant: skip zero-on-allocate (fast)
 provisioner: lvm.driver.harvesterhci.io
 reclaimPolicy: Delete
