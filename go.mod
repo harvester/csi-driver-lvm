@@ -1,6 +1,6 @@
 module github.com/harvester/csi-driver-lvm
 
-go 1.25
+go 1.25.0
 
 replace (
 	github.com/googleapis/gnostic => github.com/googleapis/gnostic v0.3.1
@@ -17,7 +17,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/urfave/cli/v2 v2.27.2
 	golang.org/x/net v0.38.0
-	golang.org/x/sys v0.31.0
+	golang.org/x/sys v0.44.0
 	google.golang.org/grpc v1.64.1
 	google.golang.org/protobuf v1.36.5
 	k8s.io/api v0.33.5
@@ -80,6 +80,5 @@ require (
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.6.0 // indirect
-	sigs.k8s.io/structured-merge-diff/v6 v6.4.0 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
