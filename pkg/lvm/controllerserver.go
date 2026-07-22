@@ -71,7 +71,6 @@ func newControllerServer(nodeID string, hostWritePath string, namespace string, 
 				csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 				// TODO
 				//				csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
-				//				csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 				//				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			}),
 		nodeID:           nodeID,
@@ -470,27 +469,58 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	}, nil
 }
 
+// snapshotSourceVolumeHandle returns the source volume handle of the snapshot
+// whose CSI snapshot ID matches snapshotID, or "" if it cannot be resolved.
+//
+// It guards every dereference: a VolumeSnapshotContent may have no handle yet
+// (not-yet-Ready or abandoned CDI clone) or a source that is a snapshot rather
+// than a volume (restore-from-snapshot clone -> nil VolumeHandle). Dereferencing
+// those unconditionally panics the plugin, and the snapshotter then retries
+// DeleteSnapshot forever -> CrashLoop (harvester/harvester#11105).
+func snapshotSourceVolumeHandle(contents []snapv1.VolumeSnapshotContent, snapshotID string) string {
+	for i := range contents {
+		snap := &contents[i]
+		if snap.Status == nil || snap.Status.SnapshotHandle == nil || *snap.Status.SnapshotHandle != snapshotID {
+			continue
+		}
+		if snap.Spec.Source.VolumeHandle == nil {
+			continue
+		}
+		return *snap.Spec.Source.VolumeHandle
+	}
+	return ""
+}
+
 func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
 	klog.Infof("DeleteSnapshot req: %v", req)
 	snapName := req.GetSnapshotId()
+	if snapName == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot ID missing in request")
+	}
 	snapshotsList, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		klog.Errorf("error listing snapshots: %v", err)
 		return nil, err
 	}
-	volID := ""
-	for _, snap := range snapshotsList.Items {
-		if *snap.Status.SnapshotHandle == snapName {
-			volID = *snap.Spec.Source.VolumeHandle
-		}
-	}
+	volID := snapshotSourceVolumeHandle(snapshotsList.Items, snapName)
 	if volID == "" {
-		klog.Errorf("snapshot %s not found", snapName)
-		return nil, status.Error(codes.NotFound, "snapshot not found")
+		// Idempotent delete: the snapshot content is gone or never resolved to a
+		// source volume. Per the CSI spec DeleteSnapshot must return OK when the
+		// snapshot does not exist, so the snapshotter stops retrying.
+		klog.Infof("snapshot %s not found or already deleted; returning success (idempotent)", snapName)
+		return &csi.DeleteSnapshotResponse{}, nil
 	}
 	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
 	if err != nil {
-		panic(err.Error())
+		if k8serror.IsNotFound(err) {
+			// Source volume already gone: we can't locate the node/vg to run lvremove.
+			// Return OK so the delete is not retried forever; any leftover LV is an
+			// orphan to be reclaimed by GC (harvester/harvester#11128).
+			klog.Warningf("source volume %s for snapshot %s not found; returning success (possible orphan LV, see #11128)", volID, snapName)
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+		klog.Errorf("error getting volume %s: %v", volID, err)
+		return nil, err
 	}
 	klog.V(4).Infof("deleting snapshot with volume %s ", snapName)
 	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
