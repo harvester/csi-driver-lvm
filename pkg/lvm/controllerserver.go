@@ -48,6 +48,11 @@ type controllerServer struct {
 	snapClient       *snapclient.Clientset
 }
 
+const (
+	snapshotNodeAnnotation = "lvm.driver.harvesterhci.io/nodeName"
+	snapshotVGAnnotation   = "lvm.driver.harvesterhci.io/vgName"
+)
+
 // NewControllerServer
 func newControllerServer(nodeID string, hostWritePath string, namespace string, provisionerImage string, pullPolicy v1.PullPolicy) (*controllerServer, error) {
 	config, err := rest.InClusterConfig()
@@ -473,31 +478,110 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
 	klog.Infof("DeleteSnapshot req: %v", req)
 	snapName := req.GetSnapshotId()
-	snapshotsList, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{})
+
+	klog.V(4).Infof("deleting snapshot %s ", snapName)
+	sa, err := cs.deleteSnapshotAction(ctx, snapName)
+	if err != nil {
+		return nil, err
+	}
+	if err := createSnapshotterPod(ctx, sa); err != nil {
+		klog.Errorf("error creating provisioner pod :%v", err)
+		return nil, err
+	}
+
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+func (cs *controllerServer) deleteSnapshotAction(
+	ctx context.Context,
+	snapName string,
+) (snapshotAction, error) {
+	snapContent, err := cs.getSnapContent(ctx, snapName)
+	if err != nil {
+		return snapshotAction{}, err
+	}
+
+	if snapContent.Spec.Source.VolumeHandle == nil {
+		return cs.delActionFromAnnotations(snapName, snapContent)
+	}
+
+	volID := *snapContent.Spec.Source.VolumeHandle
+	volume, err := cs.kubeClient.CoreV1().
+		PersistentVolumes().
+		Get(ctx, volID, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("error getting volume %s for snapshot %s: %v", volID, snapName, err)
+		return snapshotAction{}, err
+	}
+
+	return cs.delActionFromVolume(snapName, volume), nil
+}
+
+func (cs *controllerServer) getSnapContent(
+	ctx context.Context,
+	snapName string,
+) (*snapv1.VolumeSnapshotContent, error) {
+	snapshotsList, err := cs.snapClient.SnapshotV1().
+		VolumeSnapshotContents().
+		List(ctx, metav1.ListOptions{})
 	if err != nil {
 		klog.Errorf("error listing snapshots: %v", err)
 		return nil, err
 	}
-	volID := ""
-	for _, snap := range snapshotsList.Items {
-		if *snap.Status.SnapshotHandle == snapName {
-			volID = *snap.Spec.Source.VolumeHandle
+
+	for i := range snapshotsList.Items {
+		snap := &snapshotsList.Items[i]
+		if matchSnapContent(snap, snapName) {
+			return snap, nil
 		}
 	}
-	if volID == "" {
-		klog.Errorf("snapshot %s not found", snapName)
-		return nil, status.Error(codes.NotFound, "snapshot not found")
+
+	klog.Errorf("snapshot %s not found", snapName)
+	return nil, status.Error(codes.NotFound, "snapshot not found")
+}
+
+func matchSnapContent(snapContent *snapv1.VolumeSnapshotContent, snapName string) bool {
+	if snapContent.Status != nil &&
+		snapContent.Status.SnapshotHandle != nil &&
+		*snapContent.Status.SnapshotHandle == snapName {
+		return true
 	}
-	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
-	if err != nil {
-		panic(err.Error())
-	}
-	klog.V(4).Infof("deleting snapshot with volume %s ", snapName)
+	return snapContent.Spec.Source.SnapshotHandle != nil &&
+		*snapContent.Spec.Source.SnapshotHandle == snapName
+}
+
+func (cs *controllerServer) delActionFromVolume(
+	snapName string,
+	volume *v1.PersistentVolume,
+) snapshotAction {
 	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
 	node := ns[0].MatchExpressions[0].Values[0]
 	vgName := volume.Spec.CSI.VolumeAttributes["vgName"]
 
-	sa := snapshotAction{
+	return cs.newDelSnapshotAction(snapName, node, vgName)
+}
+
+func (cs *controllerServer) delActionFromAnnotations(
+	snapName string,
+	snapContent *snapv1.VolumeSnapshotContent,
+) (snapshotAction, error) {
+	node := snapContent.Annotations[snapshotNodeAnnotation]
+	vgName := snapContent.Annotations[snapshotVGAnnotation]
+	if node == "" || vgName == "" {
+		return snapshotAction{}, status.Errorf(
+			codes.FailedPrecondition,
+			"pre-existing snapshot %s requires annotations %s and %s",
+			snapName,
+			snapshotNodeAnnotation,
+			snapshotVGAnnotation,
+		)
+	}
+
+	return cs.newDelSnapshotAction(snapName, node, vgName), nil
+}
+
+func (cs *controllerServer) newDelSnapshotAction(snapName, node, vgName string) snapshotAction {
+	return snapshotAction{
 		action:           actionTypeDelete,
 		snapshotName:     snapName,
 		nodeName:         node,
@@ -509,12 +593,6 @@ func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 		provisionerImage: cs.provisionerImage,
 		pullPolicy:       cs.pullPolicy,
 	}
-	if err := createSnapshotterPod(ctx, sa); err != nil {
-		klog.Errorf("error creating provisioner pod :%v", err)
-		return nil, err
-	}
-
-	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (cs *controllerServer) ListSnapshots(_ context.Context, _ *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {

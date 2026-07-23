@@ -1,0 +1,26 @@
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotContent
+metadata:
+  name: pre-existing-lvm-snapshot-content
+  annotations:
+    lvm.driver.harvesterhci.io/nodeName: <node-that-has-the-lv-snapshot>
+    lvm.driver.harvesterhci.io/vgName: <volume-group-name>
+spec:
+  deletionPolicy: Delete
+  driver: lvm.driver.harvesterhci.io
+  source:
+    snapshotHandle: <snapshot-name-without-lvm-prefix>
+  volumeSnapshotClassName: lvm-snapshot
+  volumeSnapshotRef:
+    name: pre-existing-lvm-snapshot
+    namespace: default
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: pre-existing-lvm-snapshot
+  namespace: default
+spec:
+  source:
+    volumeSnapshotContentName: pre-existing-lvm-snapshot-content
+  volumeSnapshotClassName: lvm-snapshot

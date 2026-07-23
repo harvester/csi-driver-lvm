@@ -5,3 +5,5 @@ Before you start, you need to install the `harvester-csi-driver-lvm` first. For 
 Also, the examples contain some hardcode values. You need to modify them to fit your environment.
 - vgName: You nee to ensure the vgName was created in your environment.
 - nodeAffinity: You need to replace the value of the corresponding node name in your environment.
+
+For importing and deleting a pre-existing LVM snapshot through CSI snapshot objects, see [pre-existing-volume-snapshot.md](pre-existing-volume-snapshot.md).

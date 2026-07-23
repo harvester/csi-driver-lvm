@@ -1,0 +1,79 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  annotations:
+    cdi.harvesterhci.io/storageProfileCloneStrategy: snapshot
+    cdi.harvesterhci.io/storageProfileVolumeModeAccessModes: '{"Block":["ReadWriteOnce"]}'
+    cdi.harvesterhci.io/storageProfileVolumeSnapshotClass: lvm-snapshot
+  name: lvm-pre-existing-demo
+parameters:
+  type: dm-thin
+  vgName: vg1
+provisioner: lvm.driver.harvesterhci.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+allowedTopologies:
+- matchLabelExpressions:
+  - key: topology.lvm.csi/node
+    values:
+    - hp-107-tink-system
+---
+apiVersion: snapshot.storage.k8s.io/v1
+deletionPolicy: Retain
+driver: lvm.driver.harvesterhci.io
+kind: VolumeSnapshotClass
+metadata:
+  name: lvm-snapshot-retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pre-existing-source-pvc
+  namespace: default
+spec:
+  storageClassName: lvm-pre-existing-demo
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  volumeMode: Block
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pre-existing-source-pod
+  namespace: default
+spec:
+  containers:
+    - name: ubuntu-jammy-container
+      image: ubuntu:jammy
+      command: ["/bin/bash", "-c", "--"]
+      args: ["while true; do sleep 30; done;"]
+      volumeDevices:
+        - devicePath: "/volumes/pre-existing-source-pvc"
+          name: pre-existing-source-pvc
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.lvm.csi/node
+            operator: In
+            values:
+            - hp-107-tink-system
+  volumes:
+    - name: pre-existing-source-pvc
+      persistentVolumeClaim:
+        claimName: pre-existing-source-pvc
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: pre-existing-source-snapshot
+  namespace: default
+spec:
+  volumeSnapshotClassName: lvm-snapshot-retain
+  source:
+    persistentVolumeClaimName: pre-existing-source-pvc
