@@ -18,7 +18,6 @@ package lvm
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -41,12 +40,17 @@ type controllerServer struct {
 	caps             []*csi.ControllerServiceCapability
 	nodeID           string
 	hostWritePath    string
-	kubeClient       kubernetes.Clientset
+	kubeClient       kubernetes.Interface
 	provisionerImage string
 	pullPolicy       v1.PullPolicy
 	namespace        string
-	snapClient       *snapclient.Clientset
+	snapClient       snapclient.Interface
 }
+
+const (
+	snapshotNodeAnnotation = "lvm.driver.harvesterhci.io/nodeName"
+	snapshotVGAnnotation   = "lvm.driver.harvesterhci.io/vgName"
+)
 
 // NewControllerServer
 func newControllerServer(nodeID string, hostWritePath string, namespace string, provisionerImage string, pullPolicy v1.PullPolicy) (*controllerServer, error) {
@@ -76,7 +80,7 @@ func newControllerServer(nodeID string, hostWritePath string, namespace string, 
 			}),
 		nodeID:           nodeID,
 		hostWritePath:    hostWritePath,
-		kubeClient:       *kubeClient,
+		kubeClient:       kubeClient,
 		namespace:        namespace,
 		provisionerImage: provisionerImage,
 		pullPolicy:       pullPolicy,
@@ -94,100 +98,36 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if len(req.GetName()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Name missing in request")
 	}
-	caps := req.GetVolumeCapabilities()
-	if caps == nil {
-		return nil, status.Error(codes.InvalidArgument, "Volume Capabilities missing in request")
+	if err := validateVolumeCapabilities(req.GetVolumeCapabilities()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	// Keep a record of the requested access types.
-	var accessTypeMount, accessTypeBlock bool
-
-	for _, cap := range caps {
-		if cap.GetBlock() != nil {
-			accessTypeBlock = true
-		}
-		if cap.GetMount() != nil {
-			accessTypeMount = true
-		}
+	lvmType, vgName, err := parseLVMParameters(req.GetParameters())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	if accessTypeBlock && accessTypeMount {
-		return nil, status.Error(codes.InvalidArgument, "cannot have both block and mount access type")
+	requiredBytes, err := validateCapacityRange(req.GetCapacityRange())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	lvmType := req.GetParameters()["type"]
-	if lvmType != "striped" && lvmType != "dm-thin" {
-		return nil, status.Errorf(codes.Internal, "lvmType is incorrect: %s", lvmType)
+	volumeContext := buildVolumeContext(req.GetParameters(), requiredBytes)
+
+	node, topology, err := topologyFromAccessibility(req.GetAccessibilityRequirements())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
-	vgName := req.GetParameters()["vgName"]
-	if vgName == "" {
-		return nil, status.Error(codes.InvalidArgument, "vgName is missing, please check the storage class")
-	}
-
-	volumeContext := req.GetParameters()
-	size := strconv.FormatInt(req.GetCapacityRange().GetRequiredBytes(), 10)
-
-	volumeContext["RequiredBytes"] = size
-
-	// schedulded node of the pod is the first entry in the preferred segment
-	node := req.GetAccessibilityRequirements().GetPreferred()[0].GetSegments()[topologyKeyNode]
-	topology := []*csi.Topology{{
-		Segments: map[string]string{topologyKeyNode: node},
-	}}
 	klog.Infof("creating volume %s on node: %s", req.GetName(), node)
 
-	if req.GetVolumeContentSource() != nil {
-		klog.Infof("cloning volume with source: %v", req.GetVolumeContentSource())
-		volumeSource := req.VolumeContentSource
-		switch volumeSource.Type.(type) {
-		case *csi.VolumeContentSource_Snapshot:
-			srcSnapID := volumeSource.GetSnapshot().GetSnapshotId()
-			snapContentName := convertSnapContentName(srcSnapID)
-			snapContent, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, snapContentName, metav1.GetOptions{})
-			if err != nil {
-				klog.Errorf("error getting snapshot content: %v", err)
-				return nil, err
-			}
-			if err := cs.cloneFromSnapshot(ctx, snapContent, req.GetName(), node, lvmType, vgName, req.GetCapacityRange().GetRequiredBytes()); err != nil {
-				return nil, err
-			}
-		case *csi.VolumeContentSource_Volume:
-			srcVolID := volumeSource.GetVolume().GetVolumeId()
-			srcVolume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, srcVolID, metav1.GetOptions{})
-			if err != nil {
-				return nil, status.Errorf(codes.Unavailable, "source volume %s not found", srcVolID)
-			}
-			if err := cs.cloneFromVolume(ctx, srcVolume, req.GetName(), node, lvmType, vgName, req.GetCapacityRange().GetRequiredBytes()); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, status.Errorf(codes.InvalidArgument, "%v not a proper volume source", volumeSource)
-		}
-	} else {
-		va := volumeAction{
-			action:           actionTypeCreate,
-			name:             req.GetName(),
-			nodeName:         node,
-			size:             req.GetCapacityRange().GetRequiredBytes(),
-			lvmType:          lvmType,
-			pullPolicy:       cs.pullPolicy,
-			provisionerImage: cs.provisionerImage,
-			kubeClient:       cs.kubeClient,
-			namespace:        cs.namespace,
-			vgName:           vgName,
-			hostWritePath:    cs.hostWritePath,
-		}
-		if err := createProvisionerPod(ctx, va); err != nil {
-			klog.Errorf("error creating provisioner pod :%v", err)
-			return nil, err
-		}
+	if err := cs.provisionVolume(ctx, req, node, lvmType, vgName, requiredBytes); err != nil {
+		return nil, err
 	}
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:           req.GetName(),
-			CapacityBytes:      req.GetCapacityRange().GetRequiredBytes(),
+			CapacityBytes:      requiredBytes,
 			VolumeContext:      volumeContext,
 			ContentSource:      req.GetVolumeContentSource(),
 			AccessibleTopology: topology,
@@ -195,24 +135,127 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}, nil
 }
 
-func (cs *controllerServer) generateVolumeActionForClone(srcVol *v1.PersistentVolume, srcLVName, dstName, dstNode, dstLVType, dstVGName string, srcSize, dstSize int64) (volumeAction, error) {
-	ns := srcVol.Spec.NodeAffinity.Required.NodeSelectorTerms
-	srcNode := ns[0].MatchExpressions[0].Values[0]
-	srcVgName := srcVol.Spec.CSI.VolumeAttributes["vgName"]
-	srcType := srcVol.Spec.CSI.VolumeAttributes["type"]
+func (cs *controllerServer) provisionVolume(
+	ctx context.Context,
+	req *csi.CreateVolumeRequest,
+	node, lvmType, vgName string,
+	requiredBytes int64,
+) error {
+	if source := req.GetVolumeContentSource(); source != nil {
+		klog.Infof("cloning volume with source: %v", source)
+		return cs.cloneFromContentSource(ctx, source, req.GetName(), node, lvmType, vgName, requiredBytes)
+	}
+
+	action := cs.newCreateVolumeAction(req.GetName(), node, lvmType, vgName, requiredBytes)
+	if err := createProvisionerPod(ctx, action); err != nil {
+		klog.Errorf("error creating provisioner pod: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (cs *controllerServer) cloneFromContentSource(
+	ctx context.Context,
+	source *csi.VolumeContentSource,
+	dstName, dstNode, dstLVMType, dstVGName string,
+	dstSize int64,
+) error {
+	if source == nil {
+		return status.Error(codes.InvalidArgument, "volume content source is nil")
+	}
+	switch source.Type.(type) {
+	case *csi.VolumeContentSource_Snapshot:
+		return cs.cloneFromSnapshotSource(ctx, source.GetSnapshot(), dstName, dstNode, dstLVMType, dstVGName, dstSize)
+	case *csi.VolumeContentSource_Volume:
+		return cs.cloneFromVolumeSource(ctx, source.GetVolume(), dstName, dstNode, dstLVMType, dstVGName, dstSize)
+	default:
+		return status.Errorf(codes.InvalidArgument, "%v not a proper volume source", source)
+	}
+}
+
+func (cs *controllerServer) cloneFromSnapshotSource(
+	ctx context.Context,
+	source *csi.VolumeContentSource_SnapshotSource,
+	dstName, dstNode, dstLVMType, dstVGName string,
+	dstSize int64,
+) error {
+	snapshotID := source.GetSnapshotId()
+	if snapshotID == "" {
+		return status.Error(codes.InvalidArgument, "source snapshot ID is empty")
+	}
+
+	contentName := convertSnapContentName(snapshotID)
+	content, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, contentName, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		return status.Errorf(codes.NotFound, "source snapshot %s not found", snapshotID)
+	}
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "failed to get source snapshot %s: %v", snapshotID, err)
+	}
+	return cs.cloneFromSnapshot(ctx, content, dstName, dstNode, dstLVMType, dstVGName, dstSize)
+}
+
+func (cs *controllerServer) cloneFromVolumeSource(
+	ctx context.Context,
+	source *csi.VolumeContentSource_VolumeSource,
+	dstName, dstNode, dstLVMType, dstVGName string,
+	dstSize int64,
+) error {
+	volumeID := source.GetVolumeId()
+	if volumeID == "" {
+		return status.Error(codes.InvalidArgument, "source volume ID is empty")
+	}
+
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		return status.Errorf(codes.NotFound, "source volume %s not found", volumeID)
+	}
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "failed to get source volume %s: %v", volumeID, err)
+	}
+	return cs.cloneFromVolume(ctx, volume, dstName, dstNode, dstLVMType, dstVGName, dstSize)
+}
+
+func (cs *controllerServer) newCreateVolumeAction(name, node, lvmType, vgName string, size int64) volumeAction {
+	return volumeAction{
+		action:           actionTypeCreate,
+		name:             name,
+		nodeName:         node,
+		size:             size,
+		lvmType:          lvmType,
+		pullPolicy:       cs.pullPolicy,
+		provisionerImage: cs.provisionerImage,
+		kubeClient:       cs.kubeClient,
+		namespace:        cs.namespace,
+		vgName:           vgName,
+		hostWritePath:    cs.hostWritePath,
+	}
+}
+
+func (cs *controllerServer) generateVolumeActionForClone(
+	srcVol *v1.PersistentVolume,
+	srcLVName, dstName, dstNode, dstLVType, dstVGName string,
+	srcSize, dstSize int64,
+) (volumeAction, error) {
+	srcNode, srcVGName, srcLVMType, err := metadataFromPV(srcVol)
+	if err != nil {
+		return volumeAction{}, status.Error(codes.FailedPrecondition, err.Error())
+	}
 
 	srcInfo := &srcInfo{
 		srcLVName: srcLVName,
-		srcVGName: srcVgName,
-		srcType:   srcType,
+		srcVGName: srcVGName,
+		srcType:   srcLVMType,
 	}
-	klog.V(4).Infof("cloning volume from %s/%s ", srcVgName, srcLVName)
+	klog.V(4).Infof("cloning volume from %s/%s ", srcVGName, srcLVName)
 
 	if srcSize > dstSize {
-		return volumeAction{}, status.Errorf(codes.InvalidArgument, "source/snapshot volume size(%v) is larger than destination volume size(%v)", srcSize, dstSize)
+		return volumeAction{}, status.Errorf(codes.InvalidArgument,
+			"source/snapshot volume size(%v) is larger than destination volume size(%v)", srcSize, dstSize)
 	}
 	if srcNode != dstNode {
-		return volumeAction{}, status.Errorf(codes.InvalidArgument, "source (%s) and destination (%s) nodes are different (not supported)", srcNode, dstNode)
+		return volumeAction{}, status.Errorf(codes.InvalidArgument,
+			"source (%s) and destination (%s) nodes are different (not supported)", srcNode, dstNode)
 	}
 
 	return volumeAction{
@@ -231,15 +274,26 @@ func (cs *controllerServer) generateVolumeActionForClone(srcVol *v1.PersistentVo
 	}, nil
 }
 
-func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *snapv1.VolumeSnapshotContent, dstName, dstNode, dstLVType, dstVGName string, dstSize int64) error {
-	srcVolID := *snapContent.Spec.Source.VolumeHandle
-	srcVol, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, srcVolID, metav1.GetOptions{})
+func (cs *controllerServer) cloneFromSnapshot(
+	ctx context.Context,
+	snapContent *snapv1.VolumeSnapshotContent,
+	dstName, dstNode, dstLVType, dstVGName string,
+	dstSize int64,
+) error {
+	sourceVolumeID, snapshotID, restoreSize, err := metadataFromSnapshotContent(snapContent)
 	if err != nil {
-		klog.Errorf("error getting volume: %v", err)
-		return err
+		return status.Error(codes.FailedPrecondition, err.Error())
 	}
-	restoreSize := *snapContent.Status.RestoreSize
-	snapshotLVName := fmt.Sprintf("lvm-%s", *snapContent.Status.SnapshotHandle)
+
+	srcVol, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, sourceVolumeID, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		return status.Errorf(codes.NotFound, "source volume %s not found", sourceVolumeID)
+	}
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "failed to get source volume %s: %v", sourceVolumeID, err)
+	}
+
+	snapshotLVName := fmt.Sprintf("lvm-%s", snapshotID)
 	va, err := cs.generateVolumeActionForClone(srcVol, snapshotLVName, dstName, dstNode, dstLVType, dstVGName, restoreSize, dstSize)
 	if err != nil {
 		return err
@@ -253,11 +307,15 @@ func (cs *controllerServer) cloneFromSnapshot(ctx context.Context, snapContent *
 	return nil
 }
 
-func (cs *controllerServer) cloneFromVolume(ctx context.Context, srcVol *v1.PersistentVolume, dstName, dstNode, dstLVType, dstVGName string, dstSize int64) error {
-	srcSizeStr := srcVol.Spec.CSI.VolumeAttributes["RequiredBytes"]
-	srcSize, err := strconv.ParseInt(srcSizeStr, 10, 64)
+func (cs *controllerServer) cloneFromVolume(
+	ctx context.Context,
+	srcVol *v1.PersistentVolume,
+	dstName, dstNode, dstLVType, dstVGName string,
+	dstSize int64,
+) error {
+	srcSize, err := requiredBytesFromPersistentVolume(srcVol)
 	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "error parsing srcSize: %v", err)
+		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	srcLVName := srcVol.GetName()
 	va, err := cs.generateVolumeActionForClone(srcVol, srcLVName, dstName, dstNode, dstLVType, dstVGName, srcSize, dstSize)
@@ -274,11 +332,9 @@ func (cs *controllerServer) cloneFromVolume(ctx context.Context, srcVol *v1.Pers
 }
 
 func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	// Check arguments
-	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	if err := validateDeleteVolumeRequest(req); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
 	if err := cs.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		klog.V(3).Infof("invalid delete volume req: %v", req)
 		return nil, err
@@ -286,52 +342,80 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 
 	volID := req.GetVolumeId()
 
-	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
+	volume, err := cs.persistentVolumeForDeletion(ctx, volID)
 	if err != nil {
-		panic(err.Error())
-	}
-	klog.V(4).Infof("volume %s to be deleted", volume)
-	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
-	node := ns[0].MatchExpressions[0].Values[0]
-	srcVgName := volume.Spec.CSI.VolumeAttributes["vgName"]
-	srcType := volume.Spec.CSI.VolumeAttributes["type"]
-	srcInfo := &srcInfo{
-		srcLVName: volID,
-		srcVGName: srcVgName,
-		srcType:   srcType,
-	}
-
-	klog.V(4).Infof("from node %s ", node)
-
-	_, err = cs.kubeClient.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
-	if err != nil {
-		if k8serror.IsNotFound(err) {
-			klog.Infof("node %s not found anymore. Assuming volume %s is gone for good.", node, volID)
-			return &csi.DeleteVolumeResponse{}, nil
-		}
-		klog.Errorf("error getting nodes: %v", err)
 		return nil, err
 	}
-
-	va := volumeAction{
-		action:           actionTypeDelete,
-		name:             volID,
-		nodeName:         node,
-		pullPolicy:       cs.pullPolicy,
-		provisionerImage: cs.provisionerImage,
-		kubeClient:       cs.kubeClient,
-		namespace:        cs.namespace,
-		hostWritePath:    cs.hostWritePath,
-		srcInfo:          srcInfo,
+	if volume == nil {
+		return &csi.DeleteVolumeResponse{}, nil
 	}
+
+	klog.V(4).Infof("volume %s to be deleted", volume)
+	nodeName, vgName, lvmType, err := metadataFromPV(volume)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	klog.V(4).Infof("from node %s ", nodeName)
+	nodeAvailable, err := cs.nodeAvailableForDeletion(ctx, nodeName, volID)
+	if err != nil {
+		return nil, err
+	}
+	if !nodeAvailable {
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
+	va := cs.newDeleteVolumeAction(volID, nodeName, vgName, lvmType)
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return nil, err
 	}
 
 	klog.V(4).Infof("volume %v successfully deleted", volID)
-
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+func (cs *controllerServer) persistentVolumeForDeletion(ctx context.Context, volumeID string) (*v1.PersistentVolume, error) {
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		klog.Infof("volume %s is already absent", volumeID)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "failed to get volume %s: %v", volumeID, err)
+	}
+	return volume, nil
+}
+
+func (cs *controllerServer) nodeAvailableForDeletion(ctx context.Context, nodeName, volumeID string) (bool, error) {
+	_, err := cs.kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		klog.Infof("node %s not found anymore. Assuming volume %s is gone for good.", nodeName, volumeID)
+		return false, nil
+	}
+	if err != nil {
+		klog.Errorf("error getting nodes: %v", err)
+		return false, status.Errorf(codes.Unavailable, "failed to get node %s: %v", nodeName, err)
+	}
+	return true, nil
+}
+
+func (cs *controllerServer) newDeleteVolumeAction(volumeID, nodeName, vgName, lvmType string) volumeAction {
+	return volumeAction{
+		action:           actionTypeDelete,
+		name:             volumeID,
+		nodeName:         nodeName,
+		pullPolicy:       cs.pullPolicy,
+		provisionerImage: cs.provisionerImage,
+		kubeClient:       cs.kubeClient,
+		namespace:        cs.namespace,
+		hostWritePath:    cs.hostWritePath,
+		srcInfo: &srcInfo{
+			srcLVName: volumeID,
+			srcVGName: vgName,
+			srcType:   lvmType,
+		},
+	}
 }
 
 func (cs *controllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
@@ -350,13 +434,8 @@ func (cs *controllerServer) ValidateVolumeCapabilities(_ context.Context, req *c
 		return nil, status.Error(codes.InvalidArgument, req.VolumeId)
 	}
 
-	for _, cap := range req.GetVolumeCapabilities() {
-		if cap.GetMount() == nil && cap.GetBlock() == nil {
-			return nil, status.Error(codes.InvalidArgument, "cannot have both mount and block access type be undefined")
-		}
-
-		// A real driver would check the capabilities of the given volume with
-		// the set of requested capabilities.
+	if err := validateVolumeCapabilities(req.GetVolumeCapabilities()); err != nil {
+		return &csi.ValidateVolumeCapabilitiesResponse{Message: err.Error()}, nil
 	}
 
 	return &csi.ValidateVolumeCapabilitiesResponse{
@@ -419,102 +498,201 @@ func (cs *controllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 
 func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	klog.Infof("CreateSnapshot req: %v", req)
-	volID := req.GetSourceVolumeId()
-	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
+	snapshotName, volumeID, err := validateCreateSnapshotRequest(req)
 	if err != nil {
-		panic(err.Error())
-	}
-	klog.V(4).Infof("taking snapshot with volume %s ", volume)
-	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
-	node := ns[0].MatchExpressions[0].Values[0]
-	vgName := volume.Spec.CSI.VolumeAttributes["vgName"]
-	lvType := volume.Spec.CSI.VolumeAttributes["type"]
-	snapSizeStr := volume.Spec.CSI.VolumeAttributes["RequiredBytes"]
-	snapSize, err := strconv.ParseInt(snapSizeStr, 10, 64)
-	if err != nil {
-		klog.Errorf("error parsing snapSize: %v", err)
-		return nil, err
-	}
-	snapshotName := req.GetName()
-	snapTimestamp := &timestamppb.Timestamp{
-		Seconds: time.Now().Unix(),
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	sa := snapshotAction{
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		return nil, status.Errorf(codes.NotFound, "source volume %s not found", volumeID)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "failed to get source volume %s: %v", volumeID, err)
+	}
+
+	klog.V(4).Infof("taking snapshot with volume %s ", volume)
+	nodeName, vgName, lvmType, err := metadataFromPV(volume)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	snapSize, err := requiredBytesFromPersistentVolume(volume)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	action := cs.newCreateSnapshotAction(snapshotName, volumeID, nodeName, vgName, lvmType, snapSize)
+	if err := createSnapshotterPod(ctx, action); err != nil {
+		klog.Errorf("error creating provisioner pod :%v", err)
+		return nil, err
+	}
+
+	return newCreateSnapshotResponse(snapshotName, volumeID, snapSize), nil
+}
+
+func (cs *controllerServer) newCreateSnapshotAction(
+	snapshotName, volumeID, nodeName, vgName, lvmType string,
+	size int64,
+) snapshotAction {
+	return snapshotAction{
 		action:           actionTypeCreate,
-		srcVolName:       volID,
+		srcVolName:       volumeID,
 		snapshotName:     snapshotName,
-		nodeName:         node,
-		snapSize:         snapSize,
+		nodeName:         nodeName,
+		snapSize:         size,
 		vgName:           vgName,
-		lvType:           lvType,
+		lvType:           lvmType,
 		hostWritePath:    cs.hostWritePath,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
 		provisionerImage: cs.provisionerImage,
 		pullPolicy:       cs.pullPolicy,
 	}
-	if err := createSnapshotterPod(ctx, sa); err != nil {
-		klog.Errorf("error creating provisioner pod :%v", err)
-		return nil, err
-	}
+}
 
+func newCreateSnapshotResponse(snapshotName, volumeID string, size int64) *csi.CreateSnapshotResponse {
 	return &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
 			SnapshotId:     snapshotName,
-			SourceVolumeId: volID,
-			SizeBytes:      snapSize,
-			CreationTime:   snapTimestamp,
-			ReadyToUse:     true,
+			SourceVolumeId: volumeID,
+			SizeBytes:      size,
+			CreationTime: &timestamppb.Timestamp{
+				Seconds: time.Now().Unix(),
+			},
+			ReadyToUse: true,
 		},
-	}, nil
+	}
 }
 
 func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
 	klog.Infof("DeleteSnapshot req: %v", req)
 	snapName := req.GetSnapshotId()
-	snapshotsList, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{})
+	if snapName == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot ID missing in request")
+	}
+
+	snapContent, err := cs.getSnapshotContent(ctx, snapName)
 	if err != nil {
-		klog.Errorf("error listing snapshots: %v", err)
 		return nil, err
 	}
-	volID := ""
-	for _, snap := range snapshotsList.Items {
-		if *snap.Status.SnapshotHandle == snapName {
-			volID = *snap.Spec.Source.VolumeHandle
+	if snapContent == nil {
+		klog.Infof("snapshot %s is already absent", snapName)
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
+	action, err := cs.deleteSnapshotAction(ctx, snapName, snapContent)
+	if err != nil {
+		return nil, err
+	}
+	if action == nil {
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
+	if err := createSnapshotterPod(ctx, *action); err != nil {
+		klog.Errorf("error creating provisioner pod :%v", err)
+		return nil, err
+	}
+
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+func (cs *controllerServer) getSnapshotContent(ctx context.Context, snapshotID string) (*snapv1.VolumeSnapshotContent, error) {
+	contents, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "failed to list snapshot contents: %v", err)
+	}
+
+	for i := range contents.Items {
+		content := &contents.Items[i]
+		if content.Status != nil &&
+			content.Status.SnapshotHandle != nil &&
+			*content.Status.SnapshotHandle == snapshotID {
+			return content, nil
+		}
+		if content.Spec.Source.SnapshotHandle != nil &&
+			*content.Spec.Source.SnapshotHandle == snapshotID {
+			return content, nil
 		}
 	}
-	if volID == "" {
-		klog.Errorf("snapshot %s not found", snapName)
-		return nil, status.Error(codes.NotFound, "snapshot not found")
-	}
-	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volID, metav1.GetOptions{})
-	if err != nil {
-		panic(err.Error())
-	}
-	klog.V(4).Infof("deleting snapshot with volume %s ", snapName)
-	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
-	node := ns[0].MatchExpressions[0].Values[0]
-	vgName := volume.Spec.CSI.VolumeAttributes["vgName"]
+	return nil, nil
+}
 
-	sa := snapshotAction{
+func (cs *controllerServer) deleteSnapshotAction(
+	ctx context.Context,
+	snapshotID string,
+	content *snapv1.VolumeSnapshotContent,
+) (*snapshotAction, error) {
+	if content == nil {
+		return nil, status.Error(codes.FailedPrecondition, "snapshot content is nil")
+	}
+	if content.Spec.Source.VolumeHandle == nil {
+		return cs.deletePreExistingSnapshotAction(snapshotID, content)
+	}
+	return cs.deleteDynamicSnapshotAction(ctx, snapshotID, *content.Spec.Source.VolumeHandle)
+}
+
+func (cs *controllerServer) deletePreExistingSnapshotAction(
+	snapshotID string,
+	content *snapv1.VolumeSnapshotContent,
+) (*snapshotAction, error) {
+	if content.Spec.Source.SnapshotHandle == nil || *content.Spec.Source.SnapshotHandle == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "snapshot content %s has no source handle", content.Name)
+	}
+	nodeName := content.Annotations[snapshotNodeAnnotation]
+	vgName := content.Annotations[snapshotVGAnnotation]
+	if nodeName == "" || vgName == "" {
+		return nil, status.Errorf(
+			codes.FailedPrecondition,
+			"pre-existing snapshot %s requires annotations %s and %s",
+			snapshotID,
+			snapshotNodeAnnotation,
+			snapshotVGAnnotation,
+		)
+	}
+	action := cs.newDeleteSnapshotAction(snapshotID, nodeName, vgName)
+	return &action, nil
+}
+
+func (cs *controllerServer) deleteDynamicSnapshotAction(
+	ctx context.Context,
+	snapshotID, volumeID string,
+) (*snapshotAction, error) {
+	if volumeID == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "snapshot %s has an empty source volume handle", snapshotID)
+	}
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		klog.Warningf(
+			"source volume %s for snapshot %s is already absent; returning success to preserve delete idempotency",
+			volumeID,
+			snapshotID,
+		)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "failed to get source volume %s: %v", volumeID, err)
+	}
+	nodeName, vgName, _, err := metadataFromPV(volume)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	action := cs.newDeleteSnapshotAction(snapshotID, nodeName, vgName)
+	return &action, nil
+}
+
+func (cs *controllerServer) newDeleteSnapshotAction(snapshotID, nodeName, vgName string) snapshotAction {
+	return snapshotAction{
 		action:           actionTypeDelete,
-		snapshotName:     snapName,
-		nodeName:         node,
+		snapshotName:     snapshotID,
+		nodeName:         nodeName,
 		vgName:           vgName,
-		lvType:           "", // not used
 		hostWritePath:    cs.hostWritePath,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
 		provisionerImage: cs.provisionerImage,
 		pullPolicy:       cs.pullPolicy,
 	}
-	if err := createSnapshotterPod(ctx, sa); err != nil {
-		klog.Errorf("error creating provisioner pod :%v", err)
-		return nil, err
-	}
-
-	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (cs *controllerServer) ListSnapshots(_ context.Context, _ *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
