@@ -5,7 +5,6 @@ import (
 	"os"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog/v2"
@@ -88,12 +87,8 @@ func clonelv(c *cli.Context) error {
 
 	klog.Infof("Clone from src: %s, to dst: %s/%s", srcLvName, dstVGName, dstLV)
 
-	if !lvm.VgExists(dstVGName) {
-		lvm.VgActivate()
-		time.Sleep(1 * time.Second) // jitter
-		if !lvm.VgExists(dstVGName) {
-			return fmt.Errorf("vg %s does not exist, please check the corresponding VG is created", dstVGName)
-		}
+	if err := ensureCloneVolumeGroups(srcVgName, dstVGName); err != nil {
+		return err
 	}
 
 	klog.Infof("clone lv %s, vg: %s, type: %s", srcLvName, srcVgName, srcType)
@@ -137,5 +132,18 @@ func clonelv(c *cli.Context) error {
 
 	klog.Infof("lv: %s/%s cloned from %s", dstVGName, dstLV, srcDev)
 
+	return nil
+}
+
+func ensureCloneVolumeGroups(srcVGName, dstVGName string) error {
+	if err := lvm.EnsureVG(srcVGName); err != nil {
+		return fmt.Errorf("source volume group is unavailable: %w", err)
+	}
+	if dstVGName == srcVGName {
+		return nil
+	}
+	if err := lvm.EnsureVG(dstVGName); err != nil {
+		return fmt.Errorf("destination volume group is unavailable: %w", err)
+	}
 	return nil
 }
