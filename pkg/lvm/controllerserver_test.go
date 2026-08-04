@@ -337,3 +337,92 @@ func TestPreExistingSnapshotRequiresLocationAnnotations(t *testing.T) {
 		t.Fatalf("unexpected action: %#v", action)
 	}
 }
+
+func TestCloneFromSnapshotSourceResolvesByHandleNotName(t *testing.T) {
+	cs := controllerWithFakeClients()
+	restoreSize := int64(2 << 30)
+	// A data-mover exposer content: its object name is NOT snapcontent-<id>, it is
+	// pre-provisioned (no source VolumeHandle), and it matches only by handle.
+	cs.snapClient = &fakeSnapshotClient{contents: []snapv1.VolumeSnapshotContent{{
+		ObjectMeta: metav1.ObjectMeta{Name: "velero-exposer-abc"},
+		Spec: snapv1.VolumeSnapshotContentSpec{
+			Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer("snapshot-abc")},
+		},
+		Status: &snapv1.VolumeSnapshotContentStatus{
+			SnapshotHandle: strPointer("snapshot-abc"),
+			RestoreSize:    &restoreSize,
+		},
+	}}}
+
+	// dstSize smaller than restoreSize: proves the content was resolved by handle
+	// (else NotFound) and then the size guard fired (InvalidArgument) before any
+	// provisioner pod is created.
+	err := cs.cloneFromContentSource(
+		context.Background(),
+		&csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snapshot-abc"},
+		}},
+		"destination", "node-a", DmThinType, "vg", 1<<30,
+	)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument from size guard (proves handle resolution), got %v", err)
+	}
+}
+
+func TestCloneFromSnapshotSourceNotFound(t *testing.T) {
+	cs := controllerWithFakeClients()
+	err := cs.cloneFromContentSource(
+		context.Background(),
+		&csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "missing"},
+		}},
+		"destination", "node-a", DmThinType, "vg", 1<<30,
+	)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound for unresolved snapshot, got %v", err)
+	}
+}
+
+func TestCloneFromPreProvisionedSnapshotRejectsNodeMismatch(t *testing.T) {
+	cs := controllerWithFakeClients()
+	content := &snapv1.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pre-existing",
+			Annotations: map[string]string{snapshotNodeAnnotation: "other-node", snapshotVGAnnotation: "vg"},
+		},
+		Spec: snapv1.VolumeSnapshotContentSpec{
+			Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer("snapshot-abc")},
+		},
+	}
+	err := cs.cloneFromSnapshot(context.Background(), content, "destination", "node-a", DmThinType, "vg", 1<<30)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for node mismatch, got %v", err)
+	}
+}
+
+func TestCloneFromPreProvisionedSnapshotRejectsMissingHandle(t *testing.T) {
+	cs := controllerWithFakeClients()
+	// nil source VolumeHandle routes to the pre-provisioned path; no snapshot
+	// handle anywhere -> FailedPrecondition.
+	content := &snapv1.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: "incomplete"}}
+	err := cs.cloneFromSnapshot(context.Background(), content, "destination", "node-a", DmThinType, "vg", 1<<30)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestCloneFromDynamicSnapshotRejectsIncompleteStatus(t *testing.T) {
+	cs := controllerWithFakeClients()
+	// A dynamic content (source VolumeHandle set) with incomplete Status must be
+	// rejected via the dynamic path, not routed to the pre-provisioned one.
+	content := &snapv1.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: "dynamic"},
+		Spec: snapv1.VolumeSnapshotContentSpec{
+			Source: snapv1.VolumeSnapshotContentSource{VolumeHandle: strPointer("pvc-123")},
+		},
+	}
+	err := cs.cloneFromSnapshot(context.Background(), content, "destination", "node-a", DmThinType, "vg", 1<<30)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}

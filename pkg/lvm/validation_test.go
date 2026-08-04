@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -425,4 +426,57 @@ func TestMetadataFromPersistentVolume(t *testing.T) {
 	if _, _, _, err := metadataFromPV(malformed); err == nil {
 		t.Fatal("expected empty topology values to fail")
 	}
+}
+
+func TestPreProvisionedSnapshotMetadata(t *testing.T) {
+	statusSize := int64(2 << 30)
+
+	t.Run("prefers status handle and reports restore size", func(t *testing.T) {
+		content := &snapv1.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: "content"},
+			Spec: snapv1.VolumeSnapshotContentSpec{
+				Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer("snapshot-spec")},
+			},
+			Status: &snapv1.VolumeSnapshotContentStatus{
+				SnapshotHandle: strPointer("snapshot-status"),
+				RestoreSize:    &statusSize,
+			},
+		}
+		handle, size, err := preProvisionedSnapshotMetadata(content)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if handle != "snapshot-status" {
+			t.Fatalf("expected status handle to win, got %q", handle)
+		}
+		if size != statusSize {
+			t.Fatalf("expected restore size %d, got %d", statusSize, size)
+		}
+	})
+
+	t.Run("falls back to spec source handle and zero size", func(t *testing.T) {
+		content := &snapv1.VolumeSnapshotContent{
+			ObjectMeta: metav1.ObjectMeta{Name: "content"},
+			Spec: snapv1.VolumeSnapshotContentSpec{
+				Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer("snapshot-spec")},
+			},
+		}
+		handle, size, err := preProvisionedSnapshotMetadata(content)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if handle != "snapshot-spec" {
+			t.Fatalf("expected spec source handle, got %q", handle)
+		}
+		if size != 0 {
+			t.Fatalf("expected zero restore size, got %d", size)
+		}
+	})
+
+	t.Run("errors when no handle is present", func(t *testing.T) {
+		content := &snapv1.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: "content"}}
+		if _, _, err := preProvisionedSnapshotMetadata(content); err == nil {
+			t.Fatal("expected error for content without a snapshot handle")
+		}
+	})
 }

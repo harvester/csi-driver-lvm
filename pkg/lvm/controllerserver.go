@@ -18,7 +18,6 @@ package lvm
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -184,13 +183,19 @@ func (cs *controllerServer) cloneFromSnapshotSource(
 		return status.Error(codes.InvalidArgument, "source snapshot ID is empty")
 	}
 
-	contentName := convertSnapContentName(snapshotID)
-	content, err := cs.snapClient.SnapshotV1().VolumeSnapshotContents().Get(ctx, contentName, metav1.GetOptions{})
-	if k8serror.IsNotFound(err) {
-		return status.Errorf(codes.NotFound, "source snapshot %s not found", snapshotID)
-	}
+	// Resolve the source content by matching the CSI snapshot handle rather than
+	// deriving a VolumeSnapshotContent object name from it. Data movers (e.g.
+	// Velero's CSI snapshot data mover) clone a snapshot into their own
+	// pre-provisioned VolumeSnapshotContent (with a different object name) and
+	// delete the original, so a name-derived Get would miss it. getSnapshotContent
+	// lists and matches by .status.snapshotHandle / .spec.source.snapshotHandle,
+	// exactly as DeleteSnapshot does.
+	content, err := cs.getSnapshotContent(ctx, snapshotID)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "failed to get source snapshot %s: %v", snapshotID, err)
+		return err
+	}
+	if content == nil {
+		return status.Errorf(codes.NotFound, "source snapshot %s not found", snapshotID)
 	}
 	return cs.cloneFromSnapshot(ctx, content, dstName, dstNode, dstLVMType, dstVGName, dstSize)
 }
@@ -280,6 +285,24 @@ func (cs *controllerServer) cloneFromSnapshot(
 	dstName, dstNode, dstLVType, dstVGName string,
 	dstSize int64,
 ) error {
+	if snapContent == nil {
+		return status.Error(codes.FailedPrecondition, "snapshot content is nil")
+	}
+	// A dynamically-provisioned content records its origin PV in
+	// Spec.Source.VolumeHandle; a pre-provisioned (statically bound) content
+	// carries only Spec.Source.SnapshotHandle and has no origin PV to look up.
+	if snapContent.Spec.Source.VolumeHandle != nil {
+		return cs.cloneFromDynamicSnapshot(ctx, snapContent, dstName, dstNode, dstLVType, dstVGName, dstSize)
+	}
+	return cs.cloneFromPreProvisionedSnapshot(ctx, snapContent, dstName, dstNode, dstLVType, dstVGName, dstSize)
+}
+
+func (cs *controllerServer) cloneFromDynamicSnapshot(
+	ctx context.Context,
+	snapContent *snapv1.VolumeSnapshotContent,
+	dstName, dstNode, dstLVType, dstVGName string,
+	dstSize int64,
+) error {
 	sourceVolumeID, snapshotID, restoreSize, err := metadataFromSnapshotContent(snapContent)
 	if err != nil {
 		return status.Error(codes.FailedPrecondition, err.Error())
@@ -297,6 +320,74 @@ func (cs *controllerServer) cloneFromSnapshot(
 	va, err := cs.generateVolumeActionForClone(srcVol, snapshotLVName, dstName, dstNode, dstLVType, dstVGName, restoreSize, dstSize)
 	if err != nil {
 		return err
+	}
+
+	if err := createProvisionerPod(ctx, va); err != nil {
+		klog.Errorf("error creating provisioner pod :%v", err)
+		return err
+	}
+
+	return nil
+}
+
+// cloneFromPreProvisionedSnapshot restores a volume from a pre-provisioned
+// (statically bound) VolumeSnapshotContent, which has no origin PV to resolve.
+// The snapshot LV is node-local and lives in the same VG as its origin, and the
+// clone must land on the same node anyway, so the source node/VG default to the
+// request's target node/VG. They can be overridden with the same annotations
+// used for pre-existing snapshot deletion. This is the restore counterpart to
+// the pre-existing snapshot import/delete flow.
+func (cs *controllerServer) cloneFromPreProvisionedSnapshot(
+	ctx context.Context,
+	snapContent *snapv1.VolumeSnapshotContent,
+	dstName, dstNode, dstLVType, dstVGName string,
+	dstSize int64,
+) error {
+	snapshotID, restoreSize, err := preProvisionedSnapshotMetadata(snapContent)
+	if err != nil {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	nodeName := snapContent.Annotations[snapshotNodeAnnotation]
+	if nodeName == "" {
+		nodeName = dstNode
+	}
+	vgName := snapContent.Annotations[snapshotVGAnnotation]
+	if vgName == "" {
+		vgName = dstVGName
+	}
+	if restoreSize == 0 {
+		restoreSize = dstSize
+	}
+
+	if restoreSize > dstSize {
+		return status.Errorf(codes.InvalidArgument,
+			"source/snapshot volume size(%v) is larger than destination volume size(%v)", restoreSize, dstSize)
+	}
+	if nodeName != dstNode {
+		return status.Errorf(codes.InvalidArgument,
+			"source (%s) and destination (%s) nodes are different (not supported)", nodeName, dstNode)
+	}
+
+	snapshotLVName := fmt.Sprintf("lvm-%s", snapshotID)
+	klog.V(4).Infof("cloning volume from pre-provisioned snapshot %s/%s ", vgName, snapshotLVName)
+	va := volumeAction{
+		action:           actionTypeClone,
+		name:             dstName,
+		nodeName:         dstNode,
+		size:             dstSize,
+		lvmType:          dstLVType,
+		pullPolicy:       cs.pullPolicy,
+		provisionerImage: cs.provisionerImage,
+		kubeClient:       cs.kubeClient,
+		namespace:        cs.namespace,
+		vgName:           dstVGName,
+		hostWritePath:    cs.hostWritePath,
+		srcInfo: &srcInfo{
+			srcLVName: snapshotLVName,
+			srcVGName: vgName,
+			srcType:   dstLVType,
+		},
 	}
 
 	if err := createProvisionerPod(ctx, va); err != nil {
@@ -709,10 +800,4 @@ func (cs *controllerServer) ControllerGetVolume(_ context.Context, _ *csi.Contro
 
 func (cs *controllerServer) ControllerModifyVolume(_ context.Context, _ *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
-}
-
-func convertSnapContentName(snapID string) string {
-	// snapshotID is in the form of "snapshot-<snapID>"
-	// snapshotContentName is in the form of "snapshotcontent-<snapID>"
-	return strings.Replace(snapID, "snapshot-", "snapcontent-", 1)
 }

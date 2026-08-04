@@ -319,3 +319,31 @@ func metadataFromSnapshotContent(content *snapv1.VolumeSnapshotContent) (string,
 		*content.Status.RestoreSize,
 		nil
 }
+
+// preProvisionedSnapshotMetadata extracts the LVM snapshot handle and restore
+// size from a pre-provisioned (statically bound) VolumeSnapshotContent, which
+// carries no source volume handle. The handle is taken from Status.SnapshotHandle
+// when available, otherwise from Spec.Source.SnapshotHandle. A zero restore size
+// means the content did not report one and the caller should fall back to the
+// requested capacity.
+func preProvisionedSnapshotMetadata(content *snapv1.VolumeSnapshotContent) (string, int64, error) {
+	if content == nil {
+		return "", 0, fmt.Errorf("snapshot content is nil")
+	}
+
+	var snapshotID string
+	if content.Status != nil && content.Status.SnapshotHandle != nil && *content.Status.SnapshotHandle != "" {
+		snapshotID = *content.Status.SnapshotHandle
+	} else if content.Spec.Source.SnapshotHandle != nil && *content.Spec.Source.SnapshotHandle != "" {
+		snapshotID = *content.Spec.Source.SnapshotHandle
+	}
+	if snapshotID == "" {
+		return "", 0, fmt.Errorf("pre-provisioned snapshot content %s has no snapshot handle", content.Name)
+	}
+
+	var restoreSize int64
+	if content.Status != nil && content.Status.RestoreSize != nil && *content.Status.RestoreSize > 0 {
+		restoreSize = *content.Status.RestoreSize
+	}
+	return snapshotID, restoreSize, nil
+}
