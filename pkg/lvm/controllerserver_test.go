@@ -2,6 +2,7 @@ package lvm
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -14,6 +15,7 @@ import (
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -25,18 +27,20 @@ func strPointer(value string) *string {
 
 type fakeKubeClient struct {
 	kubernetes.Interface
-	volumes map[string]*v1.PersistentVolume
-	nodes   map[string]*v1.Node
+	volumes    map[string]*v1.PersistentVolume
+	nodes      map[string]*v1.Node
+	configmaps map[string]*v1.ConfigMap
 }
 
 func (f *fakeKubeClient) CoreV1() corev1.CoreV1Interface {
-	return &fakeCoreV1{volumes: f.volumes, nodes: f.nodes}
+	return &fakeCoreV1{volumes: f.volumes, nodes: f.nodes, configmaps: f.configmaps}
 }
 
 type fakeCoreV1 struct {
 	corev1.CoreV1Interface
-	volumes map[string]*v1.PersistentVolume
-	nodes   map[string]*v1.Node
+	volumes    map[string]*v1.PersistentVolume
+	nodes      map[string]*v1.Node
+	configmaps map[string]*v1.ConfigMap
 }
 
 func (f *fakeCoreV1) PersistentVolumes() corev1.PersistentVolumeInterface {
@@ -45,6 +49,57 @@ func (f *fakeCoreV1) PersistentVolumes() corev1.PersistentVolumeInterface {
 
 func (f *fakeCoreV1) Nodes() corev1.NodeInterface {
 	return &fakeNodes{nodes: f.nodes}
+}
+
+func (f *fakeCoreV1) ConfigMaps(_ string) corev1.ConfigMapInterface {
+	return &fakeConfigMaps{configmaps: f.configmaps}
+}
+
+// fakeConfigMaps implements just enough of ConfigMapInterface for the snapshot
+// location store: Get, Create, and a JSON merge Patch (RFC 7386) over .data,
+// where a null value deletes the key.
+type fakeConfigMaps struct {
+	corev1.ConfigMapInterface
+	configmaps map[string]*v1.ConfigMap
+}
+
+func (f *fakeConfigMaps) Get(_ context.Context, name string, _ metav1.GetOptions) (*v1.ConfigMap, error) {
+	if cm := f.configmaps[name]; cm != nil {
+		return cm.DeepCopy(), nil
+	}
+	return nil, k8serror.NewNotFound(schema.GroupResource{Resource: "configmaps"}, name)
+}
+
+func (f *fakeConfigMaps) Create(_ context.Context, cm *v1.ConfigMap, _ metav1.CreateOptions) (*v1.ConfigMap, error) {
+	if _, ok := f.configmaps[cm.Name]; ok {
+		return nil, k8serror.NewAlreadyExists(schema.GroupResource{Resource: "configmaps"}, cm.Name)
+	}
+	f.configmaps[cm.Name] = cm.DeepCopy()
+	return cm.DeepCopy(), nil
+}
+
+func (f *fakeConfigMaps) Patch(_ context.Context, name string, _ types.PatchType, data []byte, _ metav1.PatchOptions, _ ...string) (*v1.ConfigMap, error) {
+	cm := f.configmaps[name]
+	if cm == nil {
+		return nil, k8serror.NewNotFound(schema.GroupResource{Resource: "configmaps"}, name)
+	}
+	var patch struct {
+		Data map[string]*string `json:"data"`
+	}
+	if err := json.Unmarshal(data, &patch); err != nil {
+		return nil, err
+	}
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	for k, v := range patch.Data {
+		if v == nil {
+			delete(cm.Data, k)
+			continue
+		}
+		cm.Data[k] = *v
+	}
+	return cm.DeepCopy(), nil
 }
 
 type fakePersistentVolumes struct {
@@ -77,6 +132,17 @@ func (f *fakePersistentVolumes) Get(
 		return volume.DeepCopy(), nil
 	}
 	return nil, k8serror.NewNotFound(schema.GroupResource{Resource: "persistentvolumes"}, name)
+}
+
+func (f *fakePersistentVolumes) List(
+	_ context.Context,
+	_ metav1.ListOptions,
+) (*v1.PersistentVolumeList, error) {
+	list := &v1.PersistentVolumeList{}
+	for _, volume := range f.volumes {
+		list.Items = append(list.Items, *volume.DeepCopy())
+	}
+	return list, nil
 }
 
 type fakeSnapshotClient struct {
@@ -123,8 +189,9 @@ func controllerWithFakeClients() *controllerServer {
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 		}),
 		kubeClient: &fakeKubeClient{
-			volumes: map[string]*v1.PersistentVolume{},
-			nodes:   map[string]*v1.Node{},
+			volumes:    map[string]*v1.PersistentVolume{},
+			nodes:      map[string]*v1.Node{},
+			configmaps: map[string]*v1.ConfigMap{},
 		},
 		snapClient: &fakeSnapshotClient{},
 	}
@@ -307,34 +374,143 @@ func TestDeleteSnapshotIsNilSafeAndIdempotent(t *testing.T) {
 	})
 }
 
-func TestPreExistingSnapshotRequiresLocationAnnotations(t *testing.T) {
+func handleOnlyContent(name, handle string, annotations map[string]string) *snapv1.VolumeSnapshotContent {
+	return &snapv1.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations},
+		Spec: snapv1.VolumeSnapshotContentSpec{
+			Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer(handle)},
+		},
+	}
+}
+
+func TestDeleteSnapshotActionNilContent(t *testing.T) {
 	cs := controllerWithFakeClients()
 	if _, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id", nil); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected nil content to return FailedPrecondition, got %v", err)
 	}
+}
 
-	content := &snapv1.VolumeSnapshotContent{
-		ObjectMeta: metav1.ObjectMeta{Name: "pre-existing"},
-		Spec: snapv1.VolumeSnapshotContentSpec{
-			Source: snapv1.VolumeSnapshotContentSource{
-				SnapshotHandle: strPointer("snapshot-id"),
-			},
-		},
-	}
-	if _, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id", content); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition, got %v", err)
-	}
-
-	content.Annotations = map[string]string{
+func TestPreExistingSnapshotUsesAnnotationOverride(t *testing.T) {
+	cs := controllerWithFakeClients()
+	content := handleOnlyContent("pre-existing", "snapshot-id", map[string]string{
 		snapshotNodeAnnotation: "node-a",
 		snapshotVGAnnotation:   "vg",
-	}
-	action, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id", content)
+	})
+
+	actions, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id", content)
 	if err != nil {
 		t.Fatalf("annotated pre-existing snapshot failed: %v", err)
 	}
-	if action.nodeName != "node-a" || action.vgName != "vg" {
-		t.Fatalf("unexpected action: %#v", action)
+	if len(actions) != 1 || actions[0].nodeName != "node-a" || actions[0].vgName != "vg" {
+		t.Fatalf("expected single action for node-a/vg, got %#v", actions)
+	}
+}
+
+// A statically-referenced (handle-only) content with no annotations — the shape a
+// backup data-mover leaves on the Delete path — must NOT wedge. The driver
+// resolves exactly one delete target from the location it recorded for the
+// handle at CreateSnapshot.
+func TestPreExistingSnapshotUsesRecordedLocation(t *testing.T) {
+	cs := controllerWithFakeClients()
+	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vmvg"); err != nil {
+		t.Fatalf("recordSnapshotLocation failed: %v", err)
+	}
+
+	actions, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id",
+		handleOnlyContent("velero-exposer", "snapshot-id", nil))
+	if err != nil {
+		t.Fatalf("expected recorded-location resolution to succeed, got %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("expected exactly 1 delete target, got %d: %#v", len(actions), actions)
+	}
+	a := actions[0]
+	if a.action != actionTypeDelete || a.snapshotName != "snapshot-id" || a.nodeName != "node-a" || a.vgName != "vmvg" {
+		t.Fatalf("unexpected action: %#v", a)
+	}
+}
+
+// Annotations take precedence over any recorded location (explicit override).
+func TestPreExistingSnapshotAnnotationBeatsRecordedLocation(t *testing.T) {
+	cs := controllerWithFakeClients()
+	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "recorded-node", "recorded-vg"); err != nil {
+		t.Fatalf("recordSnapshotLocation failed: %v", err)
+	}
+
+	actions, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id",
+		handleOnlyContent("annotated", "snapshot-id", map[string]string{
+			snapshotNodeAnnotation: "override-node",
+			snapshotVGAnnotation:   "override-vg",
+		}))
+	if err != nil {
+		t.Fatalf("annotated delete failed: %v", err)
+	}
+	if len(actions) != 1 || actions[0].nodeName != "override-node" || actions[0].vgName != "override-vg" {
+		t.Fatalf("expected annotation override to win, got %#v", actions)
+	}
+}
+
+// When neither annotations nor a recorded location exist, the snapshot cannot be
+// located, so delete must return success (no actions) rather than a retryable
+// error that would permanently jam snapshot reconciliation.
+func TestPreExistingSnapshotIsIdempotentWhenUnresolvable(t *testing.T) {
+	cs := controllerWithFakeClients()
+	actions, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id",
+		handleOnlyContent("orphan", "snapshot-id", nil))
+	if err != nil {
+		t.Fatalf("expected idempotent success, got %v", err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("expected no actions when unresolvable, got %#v", actions)
+	}
+}
+
+// The location store must survive lazy ConfigMap creation and round-trip through
+// lookup, and forget must remove the entry so it no longer resolves.
+func TestSnapshotLocationRecordLookupForget(t *testing.T) {
+	cs := controllerWithFakeClients()
+	ctx := context.Background()
+
+	// First record creates the ConfigMap; a second records a distinct key without
+	// clobbering the first (merge-patch semantics).
+	if err := cs.recordSnapshotLocation(ctx, "snap-1", "node-a", "vg-a"); err != nil {
+		t.Fatalf("first record failed: %v", err)
+	}
+	if err := cs.recordSnapshotLocation(ctx, "snap-2", "node-b", "vg-b"); err != nil {
+		t.Fatalf("second record failed: %v", err)
+	}
+
+	node, vg, found, err := cs.lookupSnapshotLocation(ctx, "snap-1")
+	if err != nil || !found || node != "node-a" || vg != "vg-a" {
+		t.Fatalf("lookup snap-1 = (%q,%q,%t,%v); want node-a/vg-a", node, vg, found, err)
+	}
+	if _, _, found, _ := cs.lookupSnapshotLocation(ctx, "snap-2"); !found {
+		t.Fatalf("snap-2 entry was clobbered by snap-1 record")
+	}
+
+	cs.forgetSnapshotLocation(ctx, "snap-1")
+	if _, _, found, _ := cs.lookupSnapshotLocation(ctx, "snap-1"); found {
+		t.Fatalf("snap-1 still resolvable after forget")
+	}
+	if _, _, found, _ := cs.lookupSnapshotLocation(ctx, "snap-2"); !found {
+		t.Fatalf("forget snap-1 removed unrelated snap-2 entry")
+	}
+}
+
+// A missing store must read as "not found", never as an error, so an
+// unresolvable delete stays idempotent instead of wedging.
+func TestSnapshotLocationLookupMissingStore(t *testing.T) {
+	cs := controllerWithFakeClients()
+	if _, _, found, err := cs.lookupSnapshotLocation(context.Background(), "absent"); found || err != nil {
+		t.Fatalf("expected (found=false, err=nil) for missing store, got found=%t err=%v", found, err)
+	}
+}
+
+func TestPreExistingSnapshotRejectsMissingHandle(t *testing.T) {
+	cs := controllerWithFakeClients()
+	content := &snapv1.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: "no-handle"}}
+	if _, err := cs.deleteSnapshotAction(context.Background(), "snapshot-id", content); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for content without a source handle, got %v", err)
 	}
 }
 
