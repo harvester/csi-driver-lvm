@@ -22,6 +22,7 @@ import (
 	"os"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -255,7 +256,9 @@ func (ns *nodeServer) NodeGetVolumeStats(_ context.Context, in *csi.NodeGetVolum
 }
 
 func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	klog.Infof("NodeExpandVolume: %s", req)
+	// StripSecrets keeps the node-expand-secret passphrase out of the logs for
+	// encrypted volumes (external-resizer populates req.Secrets for those).
+	klog.Infof("NodeExpandVolume: %s", protosanitizer.StripSecrets(req))
 	volID, volPath, capacity, err := validateNodeExpandRequest(req)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -281,13 +284,22 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		return &csi.NodeExpandVolumeResponse{CapacityBytes: capacity}, nil
 	}
 
+	// Encrypted: the LUKS resize needs the passphrase, which reaches us only if
+	// the StorageClass wires csi.storage.k8s.io/node-expand-secret-name/-namespace
+	// so the external-resizer populates NodeExpandVolumeRequest.Secrets.
+	params, perr := extractCryptoParams(req.GetSecrets())
+	if perr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "encrypted volume %s expand is missing its passphrase secret (StorageClass needs a node-expand-secret): %v", volID, perr)
+	}
+
 	// Encrypted: grow the backing LV only (the filesystem, if any, lives on the
 	// dm-crypt mapper, not the bare LV), then grow the crypt mapping, then the
-	// filesystem on the mapper.
-	if output, eerr := extendLVS(volID, uint64(capacity), true, volPath); eerr != nil { //nolint:gosec
+	// filesystem on the mapper. Grow the LV by the LUKS2 header overhead so the
+	// decrypted device reaches the full requested capacity (matching create).
+	if output, eerr := extendLVS(volID, uint64(backingLVBytes(capacity, true)), true, volPath); eerr != nil { //nolint:gosec
 		return nil, status.Errorf(codes.Internal, "unable to expand logical volume %s: %v output:%s", volID, eerr, output)
 	}
-	if _, output, rerr := resizeEncryptedDevice(volID); rerr != nil {
+	if _, output, rerr := resizeEncryptedDevice(volID, params.passphrase); rerr != nil {
 		return nil, status.Errorf(codes.Internal, "unable to resize encrypted volume %s: %v output:%s", volID, rerr, output)
 	}
 	if !isBlock {

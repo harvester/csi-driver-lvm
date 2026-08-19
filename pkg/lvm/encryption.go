@@ -110,6 +110,25 @@ func isEncrypted(volumeContext map[string]string) bool {
 	return err == nil && enabled
 }
 
+// luks2HeaderBytes is the space cryptsetup's default LUKS2 format reserves ahead
+// of the data payload for the header and keyslot area (the default data offset
+// is 16 MiB). The dm-crypt mapper therefore exposes 16 MiB less than its backing
+// block device. We never pass --offset to luksFormat, so this default always
+// applies.
+const luks2HeaderBytes int64 = 16 * 1024 * 1024
+
+// backingLVBytes returns the backing LV size needed to expose usableBytes of
+// (decrypted) capacity. For encrypted volumes that is usableBytes plus the LUKS2
+// header overhead, so the requested capacity is honored end-to-end (e.g. a 10Gi
+// encrypted PVC yields a full 10Gi usable device, which exact-fit consumers such
+// as CDI/KubeVirt image imports require). For plain volumes it is unchanged.
+func backingLVBytes(usableBytes int64, encrypted bool) int64 {
+	if encrypted {
+		return usableBytes + luks2HeaderBytes
+	}
+	return usableBytes
+}
+
 // cryptMapperName is the dm-crypt mapping name for a volume.
 func cryptMapperName(volID string) string {
 	return cryptMapperPrefix + volID
@@ -216,14 +235,17 @@ func closeEncryptedDevice(volID string) error {
 }
 
 // resizeEncryptedDevice grows the dm-crypt mapping to match the (already
-// extended) backing LV. LUKS2 keeps the volume key in the kernel keyring while
-// open, so no passphrase is required. Returns whether the mapping was active.
-func resizeEncryptedDevice(volID string) (bool, string, error) {
+// extended) backing LV. LUKS2 re-derives the volume key from a keyslot on
+// resize unless the key is available in an accessible kernel keyring; in the
+// CSI node plugin's mount namespace it is not, so cryptsetup would otherwise
+// block on an interactive passphrase prompt. The passphrase is therefore fed
+// on stdin (via --key-file -). Returns whether the mapping was active.
+func resizeEncryptedDevice(volID, passphrase string) (bool, string, error) {
 	if !mapperExists(volID) {
 		return false, "", nil
 	}
 	mapperName := cryptMapperName(volID)
-	out, err := luksResize(newCryptExecutor(), mapperName)
+	out, err := luksResize(newCryptExecutor(), mapperName, passphrase)
 	if err != nil {
 		return true, out, fmt.Errorf("unable to resize LUKS device %s: %w output:%s", mapperName, err, out)
 	}
@@ -284,6 +306,8 @@ func luksClose(executor cryptExecutor, mapperName string) (string, error) {
 	return executor.Execute("cryptsetup", []string{"luksClose", mapperName}, "")
 }
 
-func luksResize(executor cryptExecutor, mapperName string) (string, error) {
-	return executor.Execute("cryptsetup", []string{"resize", mapperName}, "")
+func luksResize(executor cryptExecutor, mapperName, passphrase string) (string, error) {
+	// Read the passphrase from stdin (--key-file -) so cryptsetup can unlock the
+	// keyslot non-interactively; keeping it off argv avoids leaking it via ps.
+	return executor.Execute("cryptsetup", []string{"resize", "--key-file", "-", mapperName}, passphrase)
 }
