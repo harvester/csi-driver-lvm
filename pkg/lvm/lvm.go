@@ -220,9 +220,12 @@ func (lvm *Lvm) Run() error {
 	return nil
 }
 
-func mountLV(lvname, mountPath, vgName, fsType string, mountOptions []string, readOnly bool) (string, error) {
+// mountLV formats (when required) and mounts the device at lvPath onto
+// mountPath. lvPath is the resolved block device to mount: for plain volumes
+// this is /dev/<vg>/<lv>, and for encrypted volumes it is the opened dm-crypt
+// mapper (/dev/mapper/csi-lvm-<volID>) produced by NodePublishVolume.
+func mountLV(lvPath, mountPath, fsType string, mountOptions []string, readOnly bool) (string, error) {
 	executor := newCommandExecutor()
-	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvname)
 	fsType = defaultFilesystemType(fsType)
 
 	formatOutput, err := ensureFilesystem(executor, lvPath, fsType)
@@ -412,10 +415,12 @@ func normalizeMountOptions(values []string, readOnly bool) []string {
 	return append(options, "ro")
 }
 
-func bindMountLV(lvname, mountPath, vgName string, readOnly bool) (string, error) {
+// bindMountLV bind-mounts the raw block device at lvPath onto mountPath. lvPath
+// is the resolved device: /dev/<vg>/<lv> for plain volumes, or the opened
+// dm-crypt mapper (/dev/mapper/csi-lvm-<volID>) for encrypted volumes.
+func bindMountLV(lvPath, mountPath string, readOnly bool) (string, error) {
 	executor := newCommandExecutor()
-	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvname)
-	if err := prepareBindMountTarget(lvname, mountPath); err != nil {
+	if err := prepareBindMountTarget(lvPath, mountPath); err != nil {
 		return "", err
 	}
 
@@ -1076,7 +1081,8 @@ func extendLVS(name string, size uint64, isBlock bool, volumePath string) (strin
 		return lvOutput, nil
 	}
 
-	fsOutput, err := resizeFilesystem(executor, volume, volumePath)
+	devicePath := fmt.Sprintf("/dev/%s/%s", volume.VGName, volume.Name)
+	fsOutput, err := resizeFilesystem(executor, devicePath, volumePath)
 	return combineCommandOutput(lvOutput, fsOutput), err
 }
 
@@ -1099,8 +1105,7 @@ func ensureLogicalVolumeSize(executor commandExecutor, volume logicalVolume, siz
 	return output, nil
 }
 
-func resizeFilesystem(executor commandExecutor, volume logicalVolume, volumePath string) (string, error) {
-	devicePath := fmt.Sprintf("/dev/%s/%s", volume.VGName, volume.Name)
+func resizeFilesystem(executor commandExecutor, devicePath, volumePath string) (string, error) {
 	fsType, err := getFilesystemType(executor, devicePath)
 	if err != nil {
 		return "", fmt.Errorf("unable to detect filesystem on %q: %w", devicePath, err)

@@ -15,6 +15,7 @@ The Harvester-CSI-Driver-LVM provides the following features:
 - Support Volume Expansion.
 - Support Volume Snapshot.
 - Support Volume Clone.
+- Support Encryption at Rest (LUKS2 / dm-crypt).
 
 **NOTE**: The Snapshot/Clone feature only works on the same nodes. Clone works for different Volume Groups.
 
@@ -22,6 +23,40 @@ When the first `dm-thin` volume is provisioned in a volume group, the driver
 creates a `<vg-name>-thinpool` thin pool using 90% of the free extents, a 512
 KiB chunk size, 16 GiB of metadata, and an enabled volume-group metadata spare.
 Existing thin pools are used as-is and are not modified by the driver.
+
+### Encryption at Rest
+
+Volumes can be transparently encrypted at rest with LUKS2 (dm-crypt). Set
+`encrypted: "true"` on the StorageClass and reference a CSI secret that follows
+the same `CRYPTO_KEY_*` convention as Longhorn encrypted volumes — the passphrase
+lives in `CRYPTO_KEY_VALUE`. Using the platform's existing encryption-secret
+schema means the Harvester admission webhook and UI accept the StorageClass
+unchanged:
+
+```yaml
+parameters:
+  type: dm-thin
+  vgName: vg01
+  encrypted: "true"
+  csi.storage.k8s.io/provisioner-secret-name: ${pvc.name}-luks
+  csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-publish-secret-name: ${pvc.name}-luks
+  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
+```
+
+The secret must carry `CRYPTO_KEY_VALUE` (the passphrase); the optional
+`CRYPTO_KEY_CIPHER`, `CRYPTO_KEY_HASH`, `CRYPTO_KEY_SIZE` and `CRYPTO_PBKDF`
+fields tune `luksFormat` and default to `aes-xts-plain64` / `sha256` / `256` /
+`argon2i` (Longhorn's defaults) when omitted.
+
+On first `NodePublishVolume` the logical volume is LUKS2-formatted and opened as
+`/dev/mapper/csi-lvm-<volID>`; the filesystem (or raw block bind-mount) is placed
+on the mapper so all data on the backing LV is encrypted. The passphrase is fed
+to `cryptsetup` over stdin and never appears in the host process list. The
+mapping is torn down on `NodeUnpublishVolume` and grown on `NodeExpandVolume`.
+
+See `examples/storageclass-dm-thin-encrypted.yaml`. **Losing the passphrase
+makes the data unrecoverable** — manage it with a KMS-backed secret store.
 
 ## Installation ##
 

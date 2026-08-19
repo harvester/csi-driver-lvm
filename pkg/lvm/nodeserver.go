@@ -53,40 +53,61 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	// Resolve the block device to publish. For encrypted volumes this is the
+	// opened dm-crypt mapper; otherwise it is the bare logical volume.
+	devicePath := fmt.Sprintf("/dev/%s/%s", vgName, req.GetVolumeId())
+	encrypted := isEncrypted(req.GetVolumeContext())
+	if encrypted {
+		params, perr := extractCryptoParams(req.GetSecrets())
+		if perr != nil {
+			return nil, status.Error(codes.InvalidArgument, perr.Error())
+		}
+		mapperPath, oerr := openEncryptedDevice(devicePath, req.GetVolumeId(), params)
+		if oerr != nil {
+			return nil, status.Errorf(codes.Internal, "unable to open encrypted volume %s: %v", req.GetVolumeId(), oerr)
+		}
+		devicePath = mapperPath
+	}
+
 	if req.GetVolumeCapability().GetBlock() != nil {
-		err = ns.publishBlockVolume(req, vgName)
+		err = ns.publishBlockVolume(req, devicePath)
 	} else {
-		err = ns.publishFilesystemVolume(req, vgName)
+		err = ns.publishFilesystemVolume(req, devicePath)
 	}
 	if err != nil {
+		// Avoid leaking an open dm-crypt mapping if the mount step failed.
+		if encrypted {
+			if cerr := closeEncryptedDevice(req.GetVolumeId()); cerr != nil {
+				klog.Errorf("failed to close dm-crypt device for %s after publish error: %v", req.GetVolumeId(), cerr)
+			}
+		}
 		return nil, err
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) publishBlockVolume(req *csi.NodePublishVolumeRequest, vgName string) error {
-	output, err := bindMountLV(req.GetVolumeId(), req.GetTargetPath(), vgName, req.GetReadonly())
+func (ns *nodeServer) publishBlockVolume(req *csi.NodePublishVolumeRequest, devicePath string) error {
+	output, err := bindMountLV(devicePath, req.GetTargetPath(), req.GetReadonly())
 	if err != nil {
 		return fmt.Errorf("unable to bind mount lv: %w output:%s", err, output)
 	}
 	klog.Infof(
-		"block lv %s capability:%s vg:%s devices:%s created at:%s",
+		"block lv %s capability:%s device:%s devices:%s created at:%s",
 		req.GetVolumeId(),
 		req.GetVolumeCapability(),
-		vgName,
+		devicePath,
 		ns.devicesPattern,
 		req.GetTargetPath(),
 	)
 	return nil
 }
 
-func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest, vgName string) error {
+func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	mount := req.GetVolumeCapability().GetMount()
 	output, err := mountLV(
-		req.GetVolumeId(),
+		devicePath,
 		req.GetTargetPath(),
-		vgName,
 		mount.GetFsType(),
 		mount.GetMountFlags(),
 		req.GetReadonly(),
@@ -95,10 +116,10 @@ func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest,
 		return fmt.Errorf("unable to mount lv: %w output:%s", err, output)
 	}
 	klog.Infof(
-		"mounted lv %s capability:%s vg:%s devices:%s created at:%s",
+		"mounted lv %s capability:%s device:%s devices:%s created at:%s",
 		req.GetVolumeId(),
 		req.GetVolumeCapability(),
-		vgName,
+		devicePath,
 		ns.devicesPattern,
 		req.GetTargetPath(),
 	)
@@ -117,6 +138,13 @@ func (ns *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 	}
 	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "failed to remove target path %q: %v", targetPath, err)
+	}
+
+	// NodeUnpublishVolume carries no volume context or secrets, so we cannot
+	// tell here whether the volume was encrypted. closeEncryptedDevice is a
+	// no-op when no dm-crypt mapping exists, so it is safe to always attempt.
+	if err := closeEncryptedDevice(volID); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to close encrypted volume %s: %v", volID, err)
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -238,9 +266,34 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	output, err := extendLVS(volID, uint64(capacity), isBlock, volPath) //nolint:gosec
+	// Expand requests carry no volume context, so probe for an open dm-crypt
+	// mapping to decide whether this is an encrypted volume.
+	encrypted, err := encryptedVolumeActive(volID)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "unable to expand volume %q: %v output: %s", volID, err, output)
+		return nil, status.Errorf(codes.Internal, "unable to inspect encrypted volume %q: %v", volID, err)
+	}
+
+	if !encrypted {
+		output, eerr := extendLVS(volID, uint64(capacity), isBlock, volPath) //nolint:gosec
+		if eerr != nil {
+			return nil, status.Errorf(codes.Internal, "unable to expand volume %s: %v output:%s", volID, eerr, output)
+		}
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: capacity}, nil
+	}
+
+	// Encrypted: grow the backing LV only (the filesystem, if any, lives on the
+	// dm-crypt mapper, not the bare LV), then grow the crypt mapping, then the
+	// filesystem on the mapper.
+	if output, eerr := extendLVS(volID, uint64(capacity), true, volPath); eerr != nil { //nolint:gosec
+		return nil, status.Errorf(codes.Internal, "unable to expand logical volume %s: %v output:%s", volID, eerr, output)
+	}
+	if _, output, rerr := resizeEncryptedDevice(volID); rerr != nil {
+		return nil, status.Errorf(codes.Internal, "unable to resize encrypted volume %s: %v output:%s", volID, rerr, output)
+	}
+	if !isBlock {
+		if output, rerr := resizeFilesystem(newCommandExecutor(), cryptMapperPath(volID), volPath); rerr != nil {
+			return nil, status.Errorf(codes.Internal, "unable to resize filesystem for %q: %v output: %s", volID, rerr, output)
+		}
 	}
 
 	return &csi.NodeExpandVolumeResponse{

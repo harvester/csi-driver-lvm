@@ -224,7 +224,7 @@ func TestBindMountReadOnlyUsesRemount(t *testing.T) {
 	useFakeCommandExecutor(t, fake)
 
 	target := filepath.Join(t.TempDir(), "target")
-	if _, err := bindMountLV("volume", target, "vg", true); err != nil {
+	if _, err := bindMountLV("/dev/vg/volume", target, true); err != nil {
 		t.Fatalf("bindMountLV failed: %v", err)
 	}
 

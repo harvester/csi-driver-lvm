@@ -1,0 +1,60 @@
+# Encrypted-at-rest dm-thin StorageClass (LUKS2 / dm-crypt).
+#
+# Each volume provisioned from this class is LUKS2-formatted and opened as a
+# dm-crypt device on the node at NodePublishVolume, so all data written to the
+# backing logical volume is encrypted at rest. The passphrase and LUKS tuning
+# are supplied via a CSI secret that follows the same CRYPTO_KEY_* convention as
+# Longhorn encrypted volumes, so the Harvester webhook and UI accept it
+# unchanged. The passphrase is fed to cryptsetup over stdin, never via argv.
+#
+# IMPORTANT:
+# - The referenced secret must contain CRYPTO_KEY_VALUE (the passphrase). The
+#   remaining CRYPTO_KEY_* fields are optional tuning knobs; when omitted the
+#   driver applies Longhorn's defaults (aes-xts-plain64 / sha256 / 256 / argon2i).
+# - Losing the passphrase means the data is unrecoverable.
+# - ${pvc.name}/${pvc.namespace} templating lets every PVC use its own secret;
+#   replace with a fixed name/namespace if you prefer a single shared key.
+allowVolumeExpansion: true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lvm-dm-thin-encrypted
+  annotations:
+    # Clone via host-assisted copy, not snapshot smart-clone. Cloning an
+    # unencrypted source (e.g. a VM image) into this class must write the data
+    # THROUGH the target's dm-crypt mapper so it lands encrypted; a block-level
+    # smart-clone would bypass LUKS. Required for CDI image clones on Harvester.
+    cdi.harvesterhci.io/storageProfileCloneStrategy: copy
+parameters:
+  type: dm-thin
+  vgName: vg01
+  encrypted: "true"
+  csi.storage.k8s.io/provisioner-secret-name: ${pvc.name}-luks
+  csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-publish-secret-name: ${pvc.name}-luks
+  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
+provisioner: lvm.driver.harvesterhci.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowedTopologies:
+- matchLabelExpressions:
+  - key: topology.lvm.csi/node
+    values:
+    - <target node name>
+---
+# Example encryption secret for a PVC named "my-encrypted-pvc".
+# In production, generate a strong random passphrase and manage it out of band
+# (e.g. sealed-secrets, external-secrets, or a KMS-backed provider).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-encrypted-pvc-luks
+  namespace: default
+type: Opaque
+stringData:
+  CRYPTO_KEY_VALUE: "replace-with-a-strong-random-passphrase"
+  CRYPTO_KEY_PROVIDER: "secret"
+  CRYPTO_KEY_CIPHER: "aes-xts-plain64"
+  CRYPTO_KEY_HASH: "sha256"
+  CRYPTO_KEY_SIZE: "256"
+  CRYPTO_PBKDF: "argon2i"
