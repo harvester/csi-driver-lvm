@@ -250,7 +250,7 @@ func TestCloseAndResizeNoopWithoutMapper(t *testing.T) {
 	if err := closeEncryptedDevice(volID); err != nil {
 		t.Fatalf("closeEncryptedDevice should be a no-op, got %v", err)
 	}
-	active, _, err := resizeEncryptedDevice(volID)
+	active, _, err := resizeEncryptedDevice(volID, "unit-test-passphrase")
 	if err != nil || active {
 		t.Fatalf("resizeEncryptedDevice should be a no-op, got (active=%t, err=%v)", active, err)
 	}

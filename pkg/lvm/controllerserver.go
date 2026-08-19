@@ -126,7 +126,12 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	klog.Infof("creating volume %s on node: %s", req.GetName(), node)
 
-	if err := cs.provisionVolume(ctx, req, node, lvmType, vgName, requiredBytes); err != nil {
+	// Encrypted volumes lose the LUKS2 header (16 MiB) to overhead, so grow the
+	// backing LV by that much to still expose the requested capacity. The volume
+	// still reports its requested (usable) size below.
+	lvBytes := backingLVBytes(requiredBytes, isEncrypted(req.GetParameters()))
+
+	if err := cs.provisionVolume(ctx, req, node, lvmType, vgName, lvBytes); err != nil {
 		return nil, err
 	}
 
