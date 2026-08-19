@@ -21,6 +21,13 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["list", "get", "watch"]
+  # Encryption at rest: the external-provisioner sidecar resolves the
+  # csi.storage.k8s.io/provisioner-secret-name/-namespace referenced by an
+  # encrypted StorageClass. With ${pvc.namespace} templating the secret can live
+  # in any namespace, so this must be cluster-wide (matches Longhorn's chart).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["csinodes"]
     verbs: ["get", "list", "watch"]
