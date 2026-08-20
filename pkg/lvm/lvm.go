@@ -102,16 +102,19 @@ type snapshotAction struct {
 }
 
 const (
-	ThinVolType      = "thin"
-	ThinPoolType     = "thin-pool"
-	LinearType       = "linear"
-	StripedType      = "striped"
-	DmThinType       = "dm-thin"
-	actionTypeCreate = "create"
-	actionTypeDelete = "delete"
-	actionTypeClone  = "clone"
-	pullIfNotPresent = "ifnotpresent"
-	DefaultChunkSize = 4 * 1024 * 1024
+	ThinVolType          = "thin"
+	ThinPoolType         = "thin-pool"
+	LinearType           = "linear"
+	StripedType          = "striped"
+	DmThinType           = "dm-thin"
+	thinPoolDataExtents  = "90%FREE"
+	thinPoolChunkSize    = "512K"
+	thinPoolMetadataSize = "16G"
+	actionTypeCreate     = "create"
+	actionTypeDelete     = "delete"
+	actionTypeClone      = "clone"
+	pullIfNotPresent     = "ifnotpresent"
+	DefaultChunkSize     = 4 * 1024 * 1024
 
 	// Keep these exit statuses synchronized with util-linux misc-utils/blkid.c.
 	// https://github.com/util-linux/util-linux/blob/master/misc-utils/blkid.c
@@ -925,12 +928,24 @@ func prepareThinPool(vgName, lvmType string) (string, error) {
 		return thinPoolName, validateThinPool(vgName, thinPoolName)
 	}
 
-	args := []string{"-l90%FREE", "--thinpool", thinPoolName, vgName}
+	args := thinPoolCreateArgs(vgName, thinPoolName)
 	klog.Infof("lvcreate %s", args)
 	if _, err := newCommandExecutor().Execute("lvcreate", args); err != nil {
 		return "", fmt.Errorf("unable to create thin pool %q/%q: %w", vgName, thinPoolName, err)
 	}
 	return thinPoolName, nil
+}
+
+func thinPoolCreateArgs(vg, thinPoolName string) []string {
+	return []string{
+		"--type", ThinPoolType,
+		"--name", thinPoolName,
+		"--extents", thinPoolDataExtents,
+		"--chunksize", thinPoolChunkSize,
+		"--poolmetadatasize", thinPoolMetadataSize,
+		"--poolmetadataspare", "y",
+		vg,
+	}
 }
 
 func getLogicalVolume(vgName, lvName string) (logicalVolume, bool, error) {
