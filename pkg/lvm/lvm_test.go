@@ -390,7 +390,15 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		if err != nil || output != "volume created" {
 			t.Fatalf("expected thin pool and volume creation, output=%q err=%v", output, err)
 		}
-		wantPoolArgs := []string{"-l90%FREE", "--thinpool", "vg-thinpool", "vg"}
+		wantPoolArgs := []string{
+			"--type", "thin-pool",
+			"--name", "vg-thinpool",
+			"--extents", "90%FREE",
+			"--chunksize", "512K",
+			"--poolmetadatasize", "16G",
+			"--poolmetadataspare", "y",
+			"vg",
+		}
 		if !reflect.DeepEqual(fake.calls[2].args, wantPoolArgs) {
 			t.Fatalf("unexpected thin-pool creation arguments: want %#v, got %#v", wantPoolArgs, fake.calls[2].args)
 		}
@@ -845,5 +853,22 @@ func TestGetFilesystemTypeRejectsMissingWipefsSignatures(t *testing.T) {
 
 	if _, err := getFilesystemType(fake, "/dev/vg/volume"); err == nil || !strings.Contains(err.Error(), "does not contain a signatures array") {
 		t.Fatalf("expected incomplete wipefs output to fail, got %v", err)
+	}
+}
+
+func TestThinPoolCreateArgs(t *testing.T) {
+	want := []string{
+		"--type", "thin-pool",
+		"--name", "vg-test-thinpool",
+		"--extents", "90%FREE",
+		"--chunksize", "512K",
+		"--poolmetadatasize", "16G",
+		"--poolmetadataspare", "y",
+		"vg-test",
+	}
+
+	got := thinPoolCreateArgs("vg-test", "vg-test-thinpool")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("thinPoolCreateArgs() = %v, want %v", got, want)
 	}
 }

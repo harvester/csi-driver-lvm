@@ -18,6 +18,11 @@ The Harvester-CSI-Driver-LVM provides the following features:
 
 **NOTE**: The Snapshot/Clone feature only works on the same nodes. Clone works for different Volume Groups.
 
+When the first `dm-thin` volume is provisioned in a volume group, the driver
+creates a `<vg-name>-thinpool` thin pool using 90% of the free extents, a 512
+KiB chunk size, 16 GiB of metadata, and an enabled volume-group metadata spare.
+Existing thin pools are used as-is and are not modified by the driver.
+
 ## Installation ##
 
 You can use Helm to install the Harvester-CSI-Driver-LVM by remote repo or local helm chart files.
