@@ -36,90 +36,88 @@ type nodeServer struct {
 	devicesPattern    string
 }
 
-func newNodeServer(nodeID string, maxVolumesPerNode int64) *nodeServer {
-
-	VgActivate()
+func newNodeServer(nodeID string, maxVolumesPerNode int64) (*nodeServer, error) {
+	if err := VgActivate(); err != nil {
+		return nil, fmt.Errorf("unable to initialize LVM volume groups: %w", err)
+	}
 
 	return &nodeServer{
 		nodeID:            nodeID,
 		maxVolumesPerNode: maxVolumesPerNode,
-	}
+	}, nil
 }
 
 func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-
-	// Check arguments
-	if req.GetVolumeCapability() == nil {
-		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
-	}
-	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
-	}
-	if len(req.GetTargetPath()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
-	}
-
-	volAttrs := req.GetVolumeContext()
-	targetPath := req.GetTargetPath()
-	vgName := volAttrs["vgName"]
-
-	if req.GetVolumeCapability().GetBlock() != nil &&
-		req.GetVolumeCapability().GetMount() != nil {
-		return nil, status.Error(codes.InvalidArgument, "cannot have both block and mount access type")
-	}
-
-	var accessTypeMount, accessTypeBlock bool
-	volCap := req.GetVolumeCapability()
-
-	if volCap.GetBlock() != nil {
-		accessTypeBlock = true
-	}
-	if volCap.GetMount() != nil {
-		accessTypeMount = true
-	}
-
-	// sanity checks (probably more sanity checks are needed later)
-	if accessTypeBlock && accessTypeMount {
-		return nil, status.Error(codes.InvalidArgument, "cannot have both block and mount access type")
+	vgName, err := validateNodePublishRequest(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	if req.GetVolumeCapability().GetBlock() != nil {
-
-		output, err := bindMountLV(req.GetVolumeId(), targetPath, vgName)
-		if err != nil {
-			return nil, fmt.Errorf("unable to bind mount lv: %w output:%s", err, output)
-		}
-		// FIXME: VolumeCapability is a struct and not the size
-		klog.Infof("block lv %s size:%s vg:%s devices:%s created at:%s", req.GetVolumeId(), req.GetVolumeCapability(), vgName, ns.devicesPattern, targetPath)
-
-	} else if req.GetVolumeCapability().GetMount() != nil {
-
-		output, err := mountLV(req.GetVolumeId(), targetPath, vgName, req.GetVolumeCapability().GetMount().GetFsType())
-		if err != nil {
-			return nil, fmt.Errorf("unable to mount lv: %w output:%s", err, output)
-		}
-		// FIXME: VolumeCapability is a struct and not the size
-		klog.Infof("mounted lv %s size:%s vg:%s devices:%s created at:%s", req.GetVolumeId(), req.GetVolumeCapability(), vgName, ns.devicesPattern, targetPath)
-
+		err = ns.publishBlockVolume(req, vgName)
+	} else {
+		err = ns.publishFilesystemVolume(req, vgName)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
+func (ns *nodeServer) publishBlockVolume(req *csi.NodePublishVolumeRequest, vgName string) error {
+	output, err := bindMountLV(req.GetVolumeId(), req.GetTargetPath(), vgName, req.GetReadonly())
+	if err != nil {
+		return fmt.Errorf("unable to bind mount lv: %w output:%s", err, output)
+	}
+	klog.Infof(
+		"block lv %s capability:%s vg:%s devices:%s created at:%s",
+		req.GetVolumeId(),
+		req.GetVolumeCapability(),
+		vgName,
+		ns.devicesPattern,
+		req.GetTargetPath(),
+	)
+	return nil
+}
+
+func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest, vgName string) error {
+	mount := req.GetVolumeCapability().GetMount()
+	output, err := mountLV(
+		req.GetVolumeId(),
+		req.GetTargetPath(),
+		vgName,
+		mount.GetFsType(),
+		mount.GetMountFlags(),
+		req.GetReadonly(),
+	)
+	if err != nil {
+		return fmt.Errorf("unable to mount lv: %w output:%s", err, output)
+	}
+	klog.Infof(
+		"mounted lv %s capability:%s vg:%s devices:%s created at:%s",
+		req.GetVolumeId(),
+		req.GetVolumeCapability(),
+		vgName,
+		ns.devicesPattern,
+		req.GetTargetPath(),
+	)
+	return nil
+}
+
 func (ns *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-
-	volID := req.GetVolumeId()
-
 	klog.Infof("NodeUnpublishRequest: %s", req)
-	// Check arguments
-	if len(volID) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
-	}
-	if len(req.GetTargetPath()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
+	volID, targetPath, err := validateNodeUnpublishRequest(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	umountLV(req.GetTargetPath())
+	if err := unmountTarget(targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to unmount volume %q: %v", volID, err)
+	}
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		return nil, status.Errorf(codes.Internal, "failed to remove target path %q: %v", targetPath, err)
+	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -229,44 +227,36 @@ func (ns *nodeServer) NodeGetVolumeStats(_ context.Context, in *csi.NodeGetVolum
 }
 
 func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-
 	klog.Infof("NodeExpandVolume: %s", req)
-	// Check arguments
-	if req.GetCapacityRange() == nil {
-		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
-	}
-	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
-	}
-	capacity := int64(req.GetCapacityRange().GetRequiredBytes())
-
-	volID := req.GetVolumeId()
-	volPath := req.GetVolumePath()
-	if len(volPath) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume path not provided")
-	}
-
-	info, err := os.Stat(volPath)
+	volID, volPath, capacity, err := validateNodeExpandRequest(req)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Could not get file information from %s: %v", volPath, err)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	isBlock := false
-	m := info.Mode()
-	if !m.IsDir() {
-		klog.Warning("volume expand request on block device: filesystem resize has to be done externally")
-		isBlock = true
-	}
-
-	output, err := extendLVS(volID, uint64(capacity), isBlock) //nolint:gosec
-
+	isBlock, err := isBlockVolumePath(volPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to umount lv: %w output:%s", err, output)
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
+	output, err := extendLVS(volID, uint64(capacity), isBlock, volPath) //nolint:gosec
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to expand volume %q: %v output: %s", volID, err, output)
 	}
 
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: capacity,
 	}, nil
+}
 
+func isBlockVolumePath(volumePath string) (bool, error) {
+	info, err := os.Stat(volumePath)
+	if err != nil {
+		return false, fmt.Errorf("could not get file information about block volume: %w", err)
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+
+	klog.Warning("volume expand request on block device: filesystem resize has to be done externally")
+	return true, nil
 }

@@ -22,12 +22,8 @@ const (
 	snapshotPrefix         = "lvm-snapshot-"
 )
 
-func cmdNotFound(_ *cli.Context, command string) {
-	panic(fmt.Errorf("unrecognized command: %s", command))
-}
-
-func onUsageError(_ *cli.Context, _ error, _ bool) error {
-	panic(fmt.Errorf("usage error, please check your command"))
+func onUsageError(_ *cli.Context, err error, _ bool) error {
+	return fmt.Errorf("usage error: %w", err)
 }
 
 func main() {
@@ -40,7 +36,6 @@ func main() {
 		deleteSnapCmd(),
 		cloneLVCmd(),
 	}
-	p.CommandNotFound = cmdNotFound
 	p.OnUsageError = onUsageError
 
 	klog.Infof("starting csi-lvmplugin-provisioner")
