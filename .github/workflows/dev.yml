@@ -8,6 +8,10 @@ on:
 jobs:
   build-for-dev:
     uses: ./.github/workflows/factory.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
     with:
       tag: ${{ github.ref_name }}-head
       push: true

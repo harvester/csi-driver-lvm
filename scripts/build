@@ -7,20 +7,16 @@ cd $(dirname $0)/..
 
 mkdir -p bin
 if [ "$(uname)" = "Linux" ]; then
-    OTHER_LINKFLAGS="-extldflags -static -s"
+  OTHER_LINKFLAGS="-extldflags -static -s"
 fi
 
-LINKFLAGS="-X github.com/hravester/csi-driver-lvm/pkg/version.Version=$VERSION
+LINKFLAGS="-X github.com/harvester/csi-driver-lvm/pkg/version.Version=$VERSION
            -X github.com/harvester/csi-driver-lvm/pkg/version.GitCommit=$COMMIT $LINKFLAGS"
+CC="gcc"
+CGO_CFLAGS="-g -O2"
+CGO_LDFLAGS=""
 
-for arch in "amd64" "arm64"; do
-    CC="gcc"
-    CGO_CFLAGS="-g -O2"
-    CGO_LDFLAGS=""
-    if [ "$arch" = "arm64" ]; then
-        CC="aarch64-linux-gnu-gcc-11"
-    fi
-    GOARCH="$arch" CGO_ENABLED=1 CC=$CC CGO_CFLAGS=$CGO_CFLAGS CGO_LDFLAGS=$CGO_LDFLAGS go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/lvmplugin-"$arch"
-    GOARCH="$arch" CGO_ENABLED=1 CC=$CC CGO_CFLAGS=$CGO_CFLAGS CGO_LDFLAGS=$CGO_LDFLAGS go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-lvmplugin-provisioner-"$arch" cmd/provisioner/*.go
-    GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-driver-lvm-webhook-"$arch" cmd/webhook/*.go
-done
+arch=${TARGETARCH:-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}
+GOARCH="$arch" CGO_ENABLED=1 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/lvmplugin-"$arch"
+GOARCH="$arch" CGO_ENABLED=1 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-lvmplugin-provisioner-"$arch" cmd/provisioner/*.go
+GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/csi-driver-lvm-webhook-"$arch" cmd/webhook/*.go
