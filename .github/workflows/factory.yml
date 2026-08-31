@@ -10,7 +10,7 @@ on:
       refs:
         required: false
         type: string
-        default: ''
+        default: ""
 
 env:
   temp_registry: "ghcr.io"
@@ -39,59 +39,59 @@ jobs:
     env:
       MK_PLATFORMS: ${{ matrix.platform }}
     steps:
-      - name: Checkout code without refs
-        if: ${{ inputs.refs == '' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+    - name: Checkout code without refs
+      if: ${{ inputs.refs == '' }}
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Checkout code with refs
-        if: ${{ inputs.refs != '' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ inputs.refs }}
+    - name: Checkout code with refs
+      if: ${{ inputs.refs != '' }}
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        ref: ${{ inputs.refs }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Run dapper
-        run: make ci
+    - name: Run dapper
+      run: make ci
 
-      - name: Login to GitHub Container Registry
-        if: ${{ inputs.push == true }}
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Login to GitHub Container Registry
+      if: ${{ inputs.push == true }}
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker Build and Push (CSI Plugin - ${{ matrix.arch }})
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-        with:
-          provenance: false
-          context: .
-          platforms: ${{ matrix.platform }}
-          file: package/Dockerfile
-          push: ${{ inputs.push }}
-          tags: ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ env.pluginImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
+    - name: Docker Build and Push (CSI Plugin - ${{ matrix.arch }})
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+      with:
+        provenance: false
+        context: .
+        platforms: ${{ matrix.platform }}
+        file: package/Dockerfile
+        push: ${{ inputs.push }}
+        tags: ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ env.pluginImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
 
-      - name: Docker Build and Push (LVM Provisioner - ${{ matrix.arch }})
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-        with:
-          provenance: false
-          context: .
-          platforms: ${{ matrix.platform }}
-          file: package/Dockerfile.provisioner
-          push: ${{ inputs.push }}
-          tags: ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ env.provisionerImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
+    - name: Docker Build and Push (LVM Provisioner - ${{ matrix.arch }})
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+      with:
+        provenance: false
+        context: .
+        platforms: ${{ matrix.platform }}
+        file: package/Dockerfile.provisioner
+        push: ${{ inputs.push }}
+        tags: ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ env.provisionerImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
 
-      - name: Docker Build and Push (LVM Webhook - ${{ matrix.arch }})
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-        with:
-          provenance: false
-          context: .
-          platforms: ${{ matrix.platform }}
-          file: package/Dockerfile.webhook
-          push: ${{ inputs.push }}
-          tags: ${{ env.temp_registry }}/${{ github.repository_owner  }}/${{ env.webhookImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
+    - name: Docker Build and Push (LVM Webhook - ${{ matrix.arch }})
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+      with:
+        provenance: false
+        context: .
+        platforms: ${{ matrix.platform }}
+        file: package/Dockerfile.webhook
+        push: ${{ inputs.push }}
+        tags: ${{ env.temp_registry }}/${{ github.repository_owner  }}/${{ env.webhookImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
 
   manifest:
     needs: build
@@ -111,38 +111,38 @@ jobs:
           - name: webhook
             image: harvester-lvm-csi-driver-webhook
     steps:
-      - name: Read some Secrets
-        uses: rancher-eio/read-vault-secrets@d266f55186f80a893839f6e15662e67388e443e6 # v3
-        if: ${{ inputs.push == true }}
-        with:
-          secrets: |
-            secret/data/github/repo/${{ github.repository }}/dockerhub/harvester/credentials username  | DOCKER_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/dockerhub/harvester/credentials password  | DOCKER_PASSWORD ;
-      - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          username: ${{ env.DOCKER_USERNAME }}
-          password: ${{ env.DOCKER_PASSWORD }}
+    - name: Read some Secrets
+      uses: rancher-eio/read-vault-secrets@d266f55186f80a893839f6e15662e67388e443e6 # v3
+      if: ${{ inputs.push == true }}
+      with:
+        secrets: |
+          secret/data/github/repo/${{ github.repository }}/dockerhub/harvester/credentials username  | DOCKER_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/dockerhub/harvester/credentials password  | DOCKER_PASSWORD ;
+    - name: Login to Docker Hub
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        username: ${{ env.DOCKER_USERNAME }}
+        password: ${{ env.DOCKER_PASSWORD }}
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ${{ env.temp_registry }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: ${{ env.temp_registry }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest
-        run: |
-          docker buildx imagetools create \
-            -t ${{ env.repo }}/${{ matrix.component.image }}:${{ inputs.tag }} \
-            ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ matrix.component.image }}:temp-${{ github.run_id }}-amd64 \
-            ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ matrix.component.image }}:temp-${{ github.run_id }}-arm64
+    - name: Create and push multi-arch manifest
+      run: |
+        docker buildx imagetools create \
+          -t ${{ env.repo }}/${{ matrix.component.image }}:${{ inputs.tag }} \
+          ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ matrix.component.image }}:temp-${{ github.run_id }}-amd64 \
+          ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ matrix.component.image }}:temp-${{ github.run_id }}-arm64
 
-          echo "Multi-arch manifest created: ${{ env.repo }}/${{ matrix.component.image }}:${{ inputs.tag }} (Docker Hub)"
+        echo "Multi-arch manifest created: ${{ env.repo }}/${{ matrix.component.image }}:${{ inputs.tag }} (Docker Hub)"
 
-      - name: Clean up temporary packages
-        run: |
-          gh api --method DELETE /user/packages/container/${{ matrix.component.image }}
-          echo "Deleted package ${{ matrix.component.image }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Clean up temporary packages
+      run: |
+        gh api --method DELETE /user/packages/container/${{ matrix.component.image }}
+        echo "Deleted package ${{ matrix.component.image }}"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
