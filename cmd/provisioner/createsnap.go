@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/urfave/cli/v2"
 	"k8s.io/klog/v2"
@@ -69,12 +68,8 @@ func createSnap(c *cli.Context) error {
 
 	klog.Infof("create snapshot: %s source size: %d source lv: %s/%s", snapName, lvSize, vgName, lvName)
 
-	if !lvm.VgExists(vgName) {
-		lvm.VgActivate()
-		time.Sleep(1 * time.Second) // jitter
-		if !lvm.VgExists(vgName) {
-			return fmt.Errorf("vg %s does not exist, please check the corresponding VG is created", vgName)
-		}
+	if err := lvm.EnsureVG(vgName); err != nil {
+		return err
 	}
 
 	output, err := lvm.CreateSnapshot(snapName, lvName, vgName, lvSize, lvType, !createSnapshotForClone)
