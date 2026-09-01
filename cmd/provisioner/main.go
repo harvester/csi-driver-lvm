@@ -18,6 +18,9 @@ const (
 	flagSrcLVName          = "srclvname"
 	flagSrcVGName          = "srcvgname"
 	flagSrcType            = "srctype"
+	flagChunkSize          = "chunksize"
+	flagPoolMetadataSize   = "poolmetadatasize"
+	flagZeroBlocks         = "zeroblocks"
 	createSnapshotForClone = true
 	snapshotPrefix         = "lvm-snapshot-"
 )

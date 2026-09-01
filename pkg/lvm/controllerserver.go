@@ -115,17 +115,29 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, "cannot have both block and mount access type")
 	}
 
-	lvmType := req.GetParameters()["type"]
+	params := req.GetParameters()
+
+	lvmType := params["type"]
 	if lvmType != "striped" && lvmType != "dm-thin" {
 		return nil, status.Errorf(codes.Internal, "lvmType is incorrect: %s", lvmType)
 	}
 
-	vgName := req.GetParameters()["vgName"]
+	vgName := params["vgName"]
 	if vgName == "" {
 		return nil, status.Error(codes.InvalidArgument, "vgName is missing, please check the storage class")
 	}
 
-	volumeContext := req.GetParameters()
+	// Thin-pool creation parameters. Honored only when this PVC ends up creating
+	// the pool for the first time; ignored for subsequent PVCs on the same pool.
+	// Empty string preserves LVM's built-in default for that flag - which for
+	// chunkSize is undesirable on multi-TB pools (LVM auto-selects 8-16 MiB
+	// chunks, causing severe write amplification on random 4K workloads).
+	// StorageClasses shipped with this chart set explicit defaults.
+	chunkSize := params["chunkSize"]
+	poolMetadataSize := params["poolMetadataSize"]
+	zeroBlocks := params["zeroBlocks"]
+
+	volumeContext := params
 	size := strconv.FormatInt(req.GetCapacityRange().GetRequiredBytes(), 10)
 
 	volumeContext["RequiredBytes"] = size
@@ -177,6 +189,9 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			namespace:        cs.namespace,
 			vgName:           vgName,
 			hostWritePath:    cs.hostWritePath,
+			chunkSize:        chunkSize,
+			poolMetadataSize: poolMetadataSize,
+			zeroBlocks:       zeroBlocks,
 		}
 		if err := createProvisionerPod(ctx, va); err != nil {
 			klog.Errorf("error creating provisioner pod :%v", err)

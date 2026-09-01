@@ -6,6 +6,16 @@ metadata:
 parameters:
   type: dm-thin
   vgName: vg01
+  # Thin-pool creation parameters. Honored only on the very first PVC that
+  # causes the pool to be created; ignored for subsequent PVCs against the
+  # same pool. Cannot be changed after the pool exists.
+  #
+  # See https://docs.harvesterhci.io/latest/advanced/addons/lvm-local-storage
+  # for the full rationale and tuning guidance.
+  chunkSize: "1M"            # Align to RAID full-stripe width (data disks x
+                             # strip); 1M suits common layouts. Never >2M.
+  poolMetadataSize: "16G"    # covers pools up to ~256TB at 1M chunks
+  zeroBlocks: "false"        # single-tenant: skip zero-on-allocate (fast)
 provisioner: lvm.driver.harvesterhci.io
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer

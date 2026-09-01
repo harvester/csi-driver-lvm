@@ -30,6 +30,18 @@ func createLVCmd() *cli.Command {
 				Name:  flagLVMType,
 				Usage: "Required. type of lvs, can be either striped or mirrored",
 			},
+			&cli.StringFlag{
+				Name:  flagChunkSize,
+				Usage: "Optional. Thin-pool chunk size passed to lvcreate --chunksize (e.g. 512K, 1M). Applied only on first-time thin-pool creation.",
+			},
+			&cli.StringFlag{
+				Name:  flagPoolMetadataSize,
+				Usage: "Optional. Thin-pool metadata LV size passed to lvcreate --poolmetadatasize (e.g. 16G). Applied only on first-time thin-pool creation.",
+			},
+			&cli.StringFlag{
+				Name:  flagZeroBlocks,
+				Usage: "Optional. Whether to zero newly-allocated thin-pool blocks (true|false). Maps to lvcreate --zero. Applied only on first-time thin-pool creation.",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			if err := createLV(c); err != nil {
@@ -58,8 +70,12 @@ func createLV(c *cli.Context) error {
 	if lvmType == "" {
 		return fmt.Errorf("invalid empty flag %v", flagLVMType)
 	}
+	chunkSize := c.String(flagChunkSize)
+	poolMetadataSize := c.String(flagPoolMetadataSize)
+	zeroBlocks := c.String(flagZeroBlocks)
 
-	klog.Infof("create lv %s size:%d vg:%s type:%s", lvName, lvSize, vgName, lvmType)
+	klog.Infof("create lv %s size:%d vg:%s type:%s chunkSize:%q poolMetadataSize:%q zeroBlocks:%q",
+		lvName, lvSize, vgName, lvmType, chunkSize, poolMetadataSize, zeroBlocks)
 
 	if !lvm.VgExists(vgName) {
 		lvm.VgActivate()
@@ -69,7 +85,7 @@ func createLV(c *cli.Context) error {
 		}
 	}
 
-	output, err := lvm.CreateLVS(vgName, lvName, lvSize, lvmType)
+	output, err := lvm.CreateLVS(vgName, lvName, lvSize, lvmType, chunkSize, poolMetadataSize, zeroBlocks)
 	if err != nil {
 		return fmt.Errorf("unable to create lv: %w output:%s", err, output)
 	}
