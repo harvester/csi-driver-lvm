@@ -6,6 +6,9 @@ export DOCKER_BUILDKIT
 MK_HOST_ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 export MK_HOST_ARCH
 
+MK_PLATFORMS ?= linux/$(MK_HOST_ARCH)
+export MK_PLATFORMS
+
 MK_REPO_ID := $(shell echo -n "$(ROOT)$$(cat /etc/machine-id 2>/dev/null)" | sha256sum | cut -c1-8)
 export MK_REPO_ID
 
@@ -27,10 +30,9 @@ endif
 
 BANNER = @printf "$(BOLD)$(CYAN)[target: $@]$(RESET)\n"
 
-DOCKER_BUILD = docker build $(MK_DOCKER_PULL) \
+DOCKER_BUILD = docker buildx build --platform $(MK_PLATFORMS) \
     --progress=$(MK_DOCKER_PROGRESS) \
     --build-arg MK_REPO_ID \
-    --build-arg MK_HOST_ARCH \
     -f $(ROOT)/Dockerfile $(ROOT)
 
 .DEFAULT_GOAL := ci

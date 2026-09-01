@@ -12,7 +12,7 @@ if [ -e ${DOCKERFILE}.${ARCH} ]; then
 fi
 
 if docker buildx version >/dev/null 2>&1; then
-    docker buildx build --load -f ${DOCKERFILE} -t ${IMAGE} .
+    docker buildx build --platform linux/${ARCH} --load -f ${DOCKERFILE} -t ${IMAGE} .
 else
     docker build -f ${DOCKERFILE} -t ${IMAGE} .
 fi
