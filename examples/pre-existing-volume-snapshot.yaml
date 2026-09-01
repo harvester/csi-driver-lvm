@@ -1,0 +1,55 @@
+# Case 1: Explicit location annotations. Use this for legacy snapshots or
+# snapshots created outside this driver when no persisted location record exists.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotContent
+metadata:
+  name: pre-existing-lvm-snapshot-content
+  annotations:
+    lvm.driver.harvesterhci.io/nodeName: NODE_THAT_HAS_THE_LV_SNAPSHOT
+    lvm.driver.harvesterhci.io/vgName: VOLUME_GROUP_NAME
+spec:
+  deletionPolicy: Delete
+  driver: lvm.driver.harvesterhci.io
+  source:
+    snapshotHandle: SNAPSHOT_NAME_WITHOUT_LVM_PREFIX
+  volumeSnapshotClassName: lvm-snapshot
+  volumeSnapshotRef:
+    name: pre-existing-lvm-snapshot
+    namespace: default
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: pre-existing-lvm-snapshot
+  namespace: default
+spec:
+  source:
+    volumeSnapshotContentName: pre-existing-lvm-snapshot-content
+  volumeSnapshotClassName: lvm-snapshot
+---
+# Case 2: No location annotations. This works when the snapshot was originally
+# created by this driver and its persisted location record is still available,
+# including after deleting a Retain-policy VolumeSnapshotContent.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotContent
+metadata:
+  name: pre-existing-recorded-lvm-snapshot-content
+spec:
+  deletionPolicy: Delete
+  driver: lvm.driver.harvesterhci.io
+  source:
+    snapshotHandle: SNAPSHOT_HANDLE_FROM_LOCATION_RECORD
+  volumeSnapshotClassName: lvm-snapshot
+  volumeSnapshotRef:
+    name: pre-existing-recorded-lvm-snapshot
+    namespace: default
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: pre-existing-recorded-lvm-snapshot
+  namespace: default
+spec:
+  source:
+    volumeSnapshotContentName: pre-existing-recorded-lvm-snapshot-content
+  volumeSnapshotClassName: lvm-snapshot
