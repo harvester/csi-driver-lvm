@@ -14,9 +14,11 @@
 #   / argon2i). Harvester's own StorageClass webhook is stricter and wants all
 #   of them present and non-empty, as below.
 # - Losing the passphrase means the data is unrecoverable.
-# - All four secret references are set. node-stage-secret-* is not used by this
-#   driver (it does not advertise STAGE_UNSTAGE_VOLUME) but Harvester's webhook
-#   requires it on any encrypted StorageClass. node-expand-secret-* IS used:
+# - All four secret references are set. node-stage-secret-* is required by
+#   Harvester's webhook on any encrypted StorageClass, but this driver never
+#   reads it: it advertises STAGE_UNSTAGE_VOLUME while its NodeStageVolume only
+#   validates the request, and the dm-crypt mapping is opened at
+#   NodePublishVolume. node-expand-secret-* IS used:
 #   growing the filesystem means resizing the dm-crypt mapper first, and without
 #   it expansion fails with "expand is missing its passphrase secret".
 # - The secret reference here is static. ${pvc.name}/${pvc.namespace} templating

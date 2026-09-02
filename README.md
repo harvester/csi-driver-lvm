@@ -50,9 +50,11 @@ parameters:
 
 `node-expand-secret-*` is required: expansion resizes the dm-crypt mapper before
 the filesystem, so `NodeExpandVolume` needs the passphrase too.
-`node-stage-secret-*` is not used by this driver — it does not advertise
-`STAGE_UNSTAGE_VOLUME` — but Harvester's StorageClass webhook requires it on an
-encrypted class, so set it to the same secret.
+`node-stage-secret-*` is required by Harvester's StorageClass webhook on an
+encrypted class, so set it to the same secret. The driver never reads it: it
+advertises `STAGE_UNSTAGE_VOLUME`, but `NodeStageVolume` only validates its
+request and returns — the dm-crypt mapping is opened at `NodePublishVolume`, so
+that is where the passphrase is consumed.
 
 On Harvester the secret reference must also be **static**. `${pvc.name}` /
 `${pvc.namespace}` templating works on upstream Kubernetes and gives every PVC
