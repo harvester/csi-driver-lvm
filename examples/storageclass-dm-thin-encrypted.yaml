@@ -14,6 +14,16 @@
 # - Losing the passphrase means the data is unrecoverable.
 # - ${pvc.name}/${pvc.namespace} templating lets every PVC use its own secret;
 #   replace with a fixed name/namespace if you prefer a single shared key.
+# - node-expand-secret-* is required as well: growing the filesystem means
+#   resizing the dm-crypt mapper first, which needs the passphrase. Without it
+#   expansion fails with "expand is missing its passphrase secret".
+# - RESTORES (from a snapshot or a clone source) are block-level copies, so the
+#   destination inherits the source's LUKS header and can only be opened with
+#   the SOURCE's passphrase. With the ${pvc.name}-luks templating below, the
+#   restored PVC resolves to a DIFFERENT secret, so that secret must be created
+#   up front holding the source volume's passphrase. Restoring across a state
+#   mismatch (unencrypted source into this class, or an encrypted source into a
+#   plain class) is rejected at CreateVolume.
 allowVolumeExpansion: true
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -33,6 +43,8 @@ parameters:
   csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
   csi.storage.k8s.io/node-publish-secret-name: ${pvc.name}-luks
   csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-expand-secret-name: ${pvc.name}-luks
+  csi.storage.k8s.io/node-expand-secret-namespace: ${pvc.namespace}
 provisioner: lvm.driver.harvesterhci.io
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
