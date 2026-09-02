@@ -312,7 +312,7 @@ func (cs *controllerServer) validateRestoreEncryption(
 	default:
 		return status.Errorf(
 			codes.InvalidArgument,
-			"cannot restore a %s source into %s StorageClass: restores are block-level clones and "+
+			"cannot restore an %s source into an %s StorageClass: restores are block-level clones and "+
 				"cannot convert encryption state; restore into a StorageClass whose %q parameter matches the source",
 			srcState,
 			encryptionStateOf(dstEncrypted),

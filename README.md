@@ -38,16 +38,27 @@ parameters:
   type: dm-thin
   vgName: vg01
   encrypted: "true"
-  csi.storage.k8s.io/provisioner-secret-name: ${pvc.name}-luks
-  csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/node-publish-secret-name: ${pvc.name}-luks
-  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/node-expand-secret-name: ${pvc.name}-luks
-  csi.storage.k8s.io/node-expand-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/provisioner-secret-name: lvm-luks
+  csi.storage.k8s.io/provisioner-secret-namespace: default
+  csi.storage.k8s.io/node-stage-secret-name: lvm-luks
+  csi.storage.k8s.io/node-stage-secret-namespace: default
+  csi.storage.k8s.io/node-publish-secret-name: lvm-luks
+  csi.storage.k8s.io/node-publish-secret-namespace: default
+  csi.storage.k8s.io/node-expand-secret-name: lvm-luks
+  csi.storage.k8s.io/node-expand-secret-namespace: default
 ```
 
-All four secret references are required: expansion resizes the dm-crypt mapper
-before the filesystem, so `NodeExpandVolume` needs the passphrase too.
+`node-expand-secret-*` is required: expansion resizes the dm-crypt mapper before
+the filesystem, so `NodeExpandVolume` needs the passphrase too.
+`node-stage-secret-*` is not used by this driver — it does not advertise
+`STAGE_UNSTAGE_VOLUME` — but Harvester's StorageClass webhook requires it on an
+encrypted class, so set it to the same secret.
+
+On Harvester the secret reference must also be **static**. `${pvc.name}` /
+`${pvc.namespace}` templating works on upstream Kubernetes and gives every PVC
+its own key, but the Harvester webhook resolves the reference literally when the
+StorageClass is admitted and rejects a class whose secret does not already exist
+(and one whose `CRYPTO_KEY_*` fields are missing or empty).
 
 The secret must carry `CRYPTO_KEY_VALUE` (the passphrase); the optional
 `CRYPTO_KEY_CIPHER`, `CRYPTO_KEY_HASH`, `CRYPTO_KEY_SIZE` and `CRYPTO_PBKDF`
@@ -73,14 +84,18 @@ copy inherits the source's LUKS header — or its absence. Two consequences:
   source into a plain one, is rejected at `CreateVolume` with
   `InvalidArgument`. The first would LUKS-format restored data and destroy it;
   the second would expose the raw LUKS container as if it were a filesystem.
-  The node plugin enforces the same two rules independently, so a hand-built
-  pre-provisioned `PersistentVolume` cannot bypass the check.
-* **The restored volume needs the *source's* passphrase.** With
-  `${pvc.name}-luks` templating the restored PVC resolves to a different
-  secret, so create that secret up front holding the passphrase the source was
-  encrypted with. A missing credential fails at `CreateVolume`; a wrong one
-  fails at `NodePublishVolume` with `FailedPrecondition`. Neither error echoes
-  any secret value.
+  The node plugin enforces both rules again at publish time: it never
+  LUKS-formats a volume that was restored from a content source, and it refuses
+  to publish a filesystem volume whose blocks carry a LUKS header through a
+  plain StorageClass (for a raw block volume, where a workload may legitimately
+  keep its own LUKS header inside the volume, that probe is limited to
+  restores).
+* **The restored volume needs the *source's* passphrase.** When the restored
+  PVC resolves to a different secret than the source did — a per-PVC templated
+  name, or simply a different StorageClass — that secret must hold the source's
+  passphrase. A missing credential fails at `CreateVolume`; a wrong one fails at
+  `NodePublishVolume` with `FailedPrecondition`. Neither error echoes any secret
+  value.
 
 `CreateSnapshot` records the source's encryption state — non-secret metadata
 saying only whether the blocks carry a LUKS header — in the snapshot's location

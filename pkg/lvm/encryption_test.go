@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -309,10 +310,10 @@ func TestEncryptedOpenErrorMapsRestoreFailuresToFailedPrecondition(t *testing.T)
 
 // A volume restored from an encrypted source into a plain StorageClass must not
 // reach the workload as a raw LUKS container.
-func TestRejectRestoredLuksContainer(t *testing.T) {
+func TestRejectLuksContainer(t *testing.T) {
 	t.Run("luks header present", func(t *testing.T) {
 		useFakeCryptExecutor(t, &fakeCryptExecutor{t: t, results: []cryptResult{{}}})
-		err := rejectRestoredLuksContainer("/dev/vg/volume", "volume")
+		err := rejectLuksContainer("/dev/vg/volume", "volume")
 		if status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("expected FailedPrecondition, got %v", err)
 		}
@@ -322,7 +323,7 @@ func TestRejectRestoredLuksContainer(t *testing.T) {
 			t:       t,
 			results: []cryptResult{{err: commandExitError{code: cryptExitNotLuks}}},
 		})
-		if err := rejectRestoredLuksContainer("/dev/vg/volume", "volume"); err != nil {
+		if err := rejectLuksContainer("/dev/vg/volume", "volume"); err != nil {
 			t.Fatalf("a plain restored device must publish normally, got %v", err)
 		}
 	})
@@ -381,5 +382,32 @@ func assertCryptSubcommand(t *testing.T, call cryptCall, subcommand, stdin strin
 	}
 	if call.stdin != stdin {
 		t.Fatalf("expected stdin %q for %s, got %q", stdin, subcommand, call.stdin)
+	}
+}
+
+func TestShouldProbeForLuks(t *testing.T) {
+	blockCapability := &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+	}
+	mount := mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+
+	tests := []struct {
+		name       string
+		restored   bool
+		capability *csi.VolumeCapability
+		want       bool
+	}{
+		{name: "filesystem volume is always probed", capability: mount, want: true},
+		{name: "restored filesystem volume is probed", restored: true, capability: mount, want: true},
+		{name: "block volume is probed only when restored", capability: blockCapability},
+		{name: "restored block volume is probed", restored: true, capability: blockCapability, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldProbeForLuks(tt.restored, tt.capability); got != tt.want {
+				t.Fatalf("shouldProbeForLuks() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }

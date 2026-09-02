@@ -77,8 +77,8 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 			return nil, encryptedOpenError(req.GetVolumeId(), oerr)
 		}
 		devicePath = mapperPath
-	} else if restored {
-		if err := rejectRestoredLuksContainer(devicePath, req.GetVolumeId()); err != nil {
+	} else if shouldProbeForLuks(restored, req.GetVolumeCapability()) {
+		if err := rejectLuksContainer(devicePath, req.GetVolumeId()); err != nil {
 			return nil, err
 		}
 	}
@@ -113,12 +113,23 @@ func encryptedOpenError(volID string, err error) error {
 	return status.Errorf(codes.Internal, "unable to open encrypted volume %s: %v", volID, err)
 }
 
-// rejectRestoredLuksContainer stops a volume restored from an encrypted source
-// from being published through an unencrypted StorageClass. Without this the
-// workload would be handed the raw, still-locked LUKS container: a raw block
-// volume would surface as unreadable ciphertext, and a filesystem volume would
-// be at the mercy of the mount path's signature handling.
-func rejectRestoredLuksContainer(devicePath, volID string) error {
+// shouldProbeForLuks decides whether an unencrypted volume is checked for a
+// LUKS header before it is published. The driver formats and mounts a
+// filesystem volume itself, so a header on one is never legitimate: probe every
+// publish, which also covers a hand-written PV that never carried the restored
+// flag. A raw block volume is different - its workload may keep its own LUKS
+// header inside the volume - so there only a restore is checked.
+func shouldProbeForLuks(restored bool, capability *csi.VolumeCapability) bool {
+	return restored || capability.GetMount() != nil
+}
+
+// rejectLuksContainer stops a volume whose blocks carry a LUKS header - a
+// volume restored from an encrypted source, typically - from being published
+// through an unencrypted StorageClass. Without this the workload would be
+// handed the raw, still-locked container: a raw block volume would surface as
+// unreadable ciphertext, and a filesystem volume would be at the mercy of the
+// mount path's signature handling.
+func rejectLuksContainer(devicePath, volID string) error {
 	hasLuks, err := luksHeaderPresent(devicePath)
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to probe %s for a LUKS header: %v", devicePath, err)
@@ -126,8 +137,9 @@ func rejectRestoredLuksContainer(devicePath, volID string) error {
 	if hasLuks {
 		return status.Errorf(
 			codes.FailedPrecondition,
-			"volume %s was restored from an encrypted source but its StorageClass does not set %q=true; "+
-				"refusing to expose the raw LUKS container",
+			"volume %s carries a LUKS header but its StorageClass does not set %q=true; refusing to "+
+				"expose the raw LUKS container (a volume restored from an encrypted source keeps its "+
+				"source's header and can only be used through an encrypted StorageClass)",
 			volID,
 			encryptedParam,
 		)

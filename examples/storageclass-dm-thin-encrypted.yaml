@@ -9,21 +9,27 @@
 #
 # IMPORTANT:
 # - The referenced secret must contain CRYPTO_KEY_VALUE (the passphrase). The
-#   remaining CRYPTO_KEY_* fields are optional tuning knobs; when omitted the
-#   driver applies Longhorn's defaults (aes-xts-plain64 / sha256 / 256 / argon2i).
+#   remaining CRYPTO_KEY_* fields are optional tuning knobs for this driver;
+#   when omitted it applies Longhorn's defaults (aes-xts-plain64 / sha256 / 256
+#   / argon2i). Harvester's own StorageClass webhook is stricter and wants all
+#   of them present and non-empty, as below.
 # - Losing the passphrase means the data is unrecoverable.
-# - ${pvc.name}/${pvc.namespace} templating lets every PVC use its own secret;
-#   replace with a fixed name/namespace if you prefer a single shared key.
-# - node-expand-secret-* is required as well: growing the filesystem means
-#   resizing the dm-crypt mapper first, which needs the passphrase. Without it
-#   expansion fails with "expand is missing its passphrase secret".
+# - All four secret references are set. node-stage-secret-* is not used by this
+#   driver (it does not advertise STAGE_UNSTAGE_VOLUME) but Harvester's webhook
+#   requires it on any encrypted StorageClass. node-expand-secret-* IS used:
+#   growing the filesystem means resizing the dm-crypt mapper first, and without
+#   it expansion fails with "expand is missing its passphrase secret".
+# - The secret reference here is static. ${pvc.name}/${pvc.namespace} templating
+#   works on upstream Kubernetes and gives every PVC its own key, but Harvester's
+#   webhook resolves the reference literally at StorageClass-admission time and
+#   rejects a class whose secret does not already exist - so on Harvester use a
+#   static reference, or one StorageClass per key.
 # - RESTORES (from a snapshot or a clone source) are block-level copies, so the
 #   destination inherits the source's LUKS header and can only be opened with
-#   the SOURCE's passphrase. With the ${pvc.name}-luks templating below, the
-#   restored PVC resolves to a DIFFERENT secret, so that secret must be created
-#   up front holding the source volume's passphrase. Restoring across a state
-#   mismatch (unencrypted source into this class, or an encrypted source into a
-#   plain class) is rejected at CreateVolume.
+#   the SOURCE's passphrase. Restoring through a StorageClass that references a
+#   different key fails at NodePublishVolume with FailedPrecondition. Restoring
+#   across an encryption-state mismatch (unencrypted source into this class, or
+#   an encrypted source into a plain class) is rejected at CreateVolume.
 allowVolumeExpansion: true
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -39,12 +45,14 @@ parameters:
   type: dm-thin
   vgName: vg01
   encrypted: "true"
-  csi.storage.k8s.io/provisioner-secret-name: ${pvc.name}-luks
-  csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/node-publish-secret-name: ${pvc.name}-luks
-  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/node-expand-secret-name: ${pvc.name}-luks
-  csi.storage.k8s.io/node-expand-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/provisioner-secret-name: lvm-luks
+  csi.storage.k8s.io/provisioner-secret-namespace: default
+  csi.storage.k8s.io/node-stage-secret-name: lvm-luks
+  csi.storage.k8s.io/node-stage-secret-namespace: default
+  csi.storage.k8s.io/node-publish-secret-name: lvm-luks
+  csi.storage.k8s.io/node-publish-secret-namespace: default
+  csi.storage.k8s.io/node-expand-secret-name: lvm-luks
+  csi.storage.k8s.io/node-expand-secret-namespace: default
 provisioner: lvm.driver.harvesterhci.io
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
@@ -54,13 +62,14 @@ allowedTopologies:
     values:
     - <target node name>
 ---
-# Example encryption secret for a PVC named "my-encrypted-pvc".
+# The encryption secret the StorageClass above points at. It must exist before
+# the StorageClass is created on Harvester.
 # In production, generate a strong random passphrase and manage it out of band
 # (e.g. sealed-secrets, external-secrets, or a KMS-backed provider).
 apiVersion: v1
 kind: Secret
 metadata:
-  name: my-encrypted-pvc-luks
+  name: lvm-luks
   namespace: default
 type: Opaque
 stringData:
