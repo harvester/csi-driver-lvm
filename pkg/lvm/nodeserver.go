@@ -18,6 +18,7 @@ package lvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -58,16 +59,28 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	// opened dm-crypt mapper; otherwise it is the bare logical volume.
 	devicePath := fmt.Sprintf("/dev/%s/%s", vgName, req.GetVolumeId())
 	encrypted := isEncrypted(req.GetVolumeContext())
+	// Volumes restored from a snapshot or clone already hold their source's
+	// blocks, so the encryption state on disk is the source's, not this
+	// StorageClass's. Both mismatch directions are rejected at CreateVolume; the
+	// checks below are the last line of defence for a volume that reached the
+	// node anyway (a hand-written PV, or a PV created before this validation).
+	restored := isRestoredFromSource(req.GetVolumeContext())
 	if encrypted {
 		params, perr := extractCryptoParams(req.GetSecrets())
 		if perr != nil {
 			return nil, status.Error(codes.InvalidArgument, perr.Error())
 		}
-		mapperPath, oerr := openEncryptedDevice(devicePath, req.GetVolumeId(), params)
+		// allowFormat is false for restores: no LUKS header there means the
+		// source was unencrypted, and formatting would destroy restored data.
+		mapperPath, oerr := openEncryptedDevice(devicePath, req.GetVolumeId(), params, !restored)
 		if oerr != nil {
-			return nil, status.Errorf(codes.Internal, "unable to open encrypted volume %s: %v", req.GetVolumeId(), oerr)
+			return nil, encryptedOpenError(req.GetVolumeId(), oerr)
 		}
 		devicePath = mapperPath
+	} else if restored {
+		if err := rejectRestoredLuksContainer(devicePath, req.GetVolumeId()); err != nil {
+			return nil, err
+		}
 	}
 
 	if req.GetVolumeCapability().GetBlock() != nil {
@@ -86,6 +99,40 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// encryptedOpenError maps a failure to open the dm-crypt mapping onto a CSI
+// code. A wrong or missing passphrase and an unencrypted restore source are
+// configuration problems an operator has to fix, so they get FailedPrecondition
+// (which the CO surfaces without hiding it behind endless retries) instead of
+// the generic Internal used for transient cryptsetup failures.
+func encryptedOpenError(volID string, err error) error {
+	if errors.Is(err, errBadPassphrase) || errors.Is(err, errRestoredVolumeNotLuks) {
+		return status.Errorf(codes.FailedPrecondition, "unable to open encrypted volume %s: %v", volID, err)
+	}
+	return status.Errorf(codes.Internal, "unable to open encrypted volume %s: %v", volID, err)
+}
+
+// rejectRestoredLuksContainer stops a volume restored from an encrypted source
+// from being published through an unencrypted StorageClass. Without this the
+// workload would be handed the raw, still-locked LUKS container: a raw block
+// volume would surface as unreadable ciphertext, and a filesystem volume would
+// be at the mercy of the mount path's signature handling.
+func rejectRestoredLuksContainer(devicePath, volID string) error {
+	hasLuks, err := luksHeaderPresent(devicePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to probe %s for a LUKS header: %v", devicePath, err)
+	}
+	if hasLuks {
+		return status.Errorf(
+			codes.FailedPrecondition,
+			"volume %s was restored from an encrypted source but its StorageClass does not set %q=true; "+
+				"refusing to expose the raw LUKS container",
+			volID,
+			encryptedParam,
+		)
+	}
+	return nil
 }
 
 func (ns *nodeServer) publishBlockVolume(req *csi.NodePublishVolumeRequest, devicePath string) error {

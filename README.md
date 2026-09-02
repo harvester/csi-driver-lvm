@@ -42,7 +42,12 @@ parameters:
   csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
   csi.storage.k8s.io/node-publish-secret-name: ${pvc.name}-luks
   csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-expand-secret-name: ${pvc.name}-luks
+  csi.storage.k8s.io/node-expand-secret-namespace: ${pvc.namespace}
 ```
+
+All four secret references are required: expansion resizes the dm-crypt mapper
+before the filesystem, so `NodeExpandVolume` needs the passphrase too.
 
 The secret must carry `CRYPTO_KEY_VALUE` (the passphrase); the optional
 `CRYPTO_KEY_CIPHER`, `CRYPTO_KEY_HASH`, `CRYPTO_KEY_SIZE` and `CRYPTO_PBKDF`
@@ -57,6 +62,41 @@ mapping is torn down on `NodeUnpublishVolume` and grown on `NodeExpandVolume`.
 
 See `examples/storageclass-dm-thin-encrypted.yaml`. **Losing the passphrase
 makes the data unrecoverable** — manage it with a KMS-backed secret store.
+
+#### Snapshots, clones and restores
+
+A snapshot or clone is a block-level copy of the source logical volume, so the
+copy inherits the source's LUKS header — or its absence. Two consequences:
+
+* **Encryption state cannot be converted by a restore.** Restoring an
+  unencrypted source into an `encrypted: "true"` StorageClass, or an encrypted
+  source into a plain one, is rejected at `CreateVolume` with
+  `InvalidArgument`. The first would LUKS-format restored data and destroy it;
+  the second would expose the raw LUKS container as if it were a filesystem.
+  The node plugin enforces the same two rules independently, so a hand-built
+  pre-provisioned `PersistentVolume` cannot bypass the check.
+* **The restored volume needs the *source's* passphrase.** With
+  `${pvc.name}-luks` templating the restored PVC resolves to a different
+  secret, so create that secret up front holding the passphrase the source was
+  encrypted with. A missing credential fails at `CreateVolume`; a wrong one
+  fails at `NodePublishVolume` with `FailedPrecondition`. Neither error echoes
+  any secret value.
+
+`CreateSnapshot` records the source's encryption state — non-secret metadata
+saying only whether the blocks carry a LUKS header — in the snapshot's location
+`ConfigMap`, so a restore can still be validated after the source volume is
+gone. For a pre-provisioned `VolumeSnapshotContent` created by hand (no such
+record exists), declare the state with the
+`lvm.driver.harvesterhci.io/encrypted: "true"|"false"` annotation on the
+content. Without either, the source state is unknown: restoring into a plain
+StorageClass is allowed (the node still refuses to publish a stray LUKS
+container), and restoring into an encrypted one is rejected.
+
+Cloning an *unencrypted* source (a VM image, for example) into an encrypted
+class is a different operation from a restore: the data has to be written
+through the target's dm-crypt mapper. Set
+`cdi.harvesterhci.io/storageProfileCloneStrategy: copy` on the StorageClass so
+CDI performs a host-assisted copy rather than a block-level clone.
 
 ## Installation ##
 

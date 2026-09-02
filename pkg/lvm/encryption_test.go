@@ -5,6 +5,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type cryptCall struct {
@@ -182,7 +185,7 @@ func TestOpenEncryptedDeviceFormatsWhenNotLuks(t *testing.T) {
 		keySize:    defaultCryptoKeySize,
 		pbkdf:      defaultCryptoPBKDF,
 	}
-	mapperPath, err := openEncryptedDevice("/dev/vg/"+volID, volID, params)
+	mapperPath, err := openEncryptedDevice("/dev/vg/"+volID, volID, params, true)
 	if err != nil {
 		t.Fatalf("openEncryptedDevice failed: %v", err)
 	}
@@ -230,7 +233,7 @@ func TestOpenEncryptedDeviceSkipsFormatWhenLuks(t *testing.T) {
 	}
 	useFakeCryptExecutor(t, fake)
 
-	if _, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: "pw"}); err != nil {
+	if _, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: "pw"}, true); err != nil {
 		t.Fatalf("openEncryptedDevice failed: %v", err)
 	}
 	if len(fake.calls) != 2 {
@@ -238,6 +241,111 @@ func TestOpenEncryptedDeviceSkipsFormatWhenLuks(t *testing.T) {
 	}
 	assertCryptSubcommand(t, fake.calls[0], "isLuks", "")
 	assertCryptSubcommand(t, fake.calls[1], "luksOpen", "pw")
+}
+
+// A volume restored from an unencrypted source carries real data but no LUKS
+// header. Formatting it would destroy that data, so the open must fail instead.
+func TestOpenEncryptedDeviceRefusesToFormatRestoredVolume(t *testing.T) {
+	const volID = "unit-open-restored-plain"
+	fake := &fakeCryptExecutor{
+		t:       t,
+		results: []cryptResult{{err: commandExitError{code: cryptExitNotLuks}}}, // isLuks -> not luks
+	}
+	useFakeCryptExecutor(t, fake)
+
+	_, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: "pw"}, false)
+	if !errors.Is(err, errRestoredVolumeNotLuks) {
+		t.Fatalf("expected errRestoredVolumeNotLuks, got %v", err)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected only the isLuks probe, got %#v", fake.calls)
+	}
+	assertCryptSubcommand(t, fake.calls[0], "isLuks", "")
+}
+
+// Restoring an encrypted snapshot with a secret holding a different passphrase
+// must surface as errBadPassphrase, not as an opaque cryptsetup failure.
+func TestOpenEncryptedDeviceReportsBadPassphrase(t *testing.T) {
+	const volID = "unit-open-wrong-key"
+	const passphrase = "wrong-passphrase"
+	fake := &fakeCryptExecutor{
+		t: t,
+		results: []cryptResult{
+			{}, // isLuks -> is luks
+			{output: "No key available with this passphrase.", err: commandExitError{code: cryptExitNoPermission}},
+		},
+	}
+	useFakeCryptExecutor(t, fake)
+
+	_, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: passphrase}, false)
+	if !errors.Is(err, errBadPassphrase) {
+		t.Fatalf("expected errBadPassphrase, got %v", err)
+	}
+	if strings.Contains(err.Error(), passphrase) {
+		t.Fatalf("passphrase leaked into the error: %v", err)
+	}
+}
+
+// The mapped CSI codes matter: an operator-fixable credential or state problem
+// must not be reported as a transient Internal error.
+func TestEncryptedOpenErrorMapsRestoreFailuresToFailedPrecondition(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{name: "bad passphrase", err: errBadPassphrase, want: codes.FailedPrecondition},
+		{name: "unencrypted restore source", err: errRestoredVolumeNotLuks, want: codes.FailedPrecondition},
+		{name: "cryptsetup failure", err: errors.New("device busy"), want: codes.Internal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := status.Code(encryptedOpenError("volume", tt.err)); got != tt.want {
+				t.Fatalf("encryptedOpenError code = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A volume restored from an encrypted source into a plain StorageClass must not
+// reach the workload as a raw LUKS container.
+func TestRejectRestoredLuksContainer(t *testing.T) {
+	t.Run("luks header present", func(t *testing.T) {
+		useFakeCryptExecutor(t, &fakeCryptExecutor{t: t, results: []cryptResult{{}}})
+		err := rejectRestoredLuksContainer("/dev/vg/volume", "volume")
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("expected FailedPrecondition, got %v", err)
+		}
+	})
+	t.Run("plain device", func(t *testing.T) {
+		useFakeCryptExecutor(t, &fakeCryptExecutor{
+			t:       t,
+			results: []cryptResult{{err: commandExitError{code: cryptExitNotLuks}}},
+		})
+		if err := rejectRestoredLuksContainer("/dev/vg/volume", "volume"); err != nil {
+			t.Fatalf("a plain restored device must publish normally, got %v", err)
+		}
+	})
+}
+
+func TestIsRestoredFromSource(t *testing.T) {
+	tests := []struct {
+		name    string
+		context map[string]string
+		want    bool
+	}{
+		{name: "absent", context: map[string]string{}},
+		{name: "false", context: map[string]string{restoredFromSourceKey: "false"}},
+		{name: "malformed", context: map[string]string{restoredFromSourceKey: "yes-please"}},
+		{name: "true", context: map[string]string{restoredFromSourceKey: "true"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRestoredFromSource(tt.context); got != tt.want {
+				t.Fatalf("isRestoredFromSource = %t, want %t", got, tt.want)
+			}
+		})
+	}
 }
 
 // For a plain (non-encrypted) volume no dm-crypt mapper exists, so the

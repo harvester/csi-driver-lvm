@@ -2,6 +2,7 @@ package lvm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -59,6 +60,21 @@ func (f *fakeCoreV1) Nodes() corev1.NodeInterface {
 
 func (f *fakeCoreV1) ConfigMaps(_ string) corev1.ConfigMapInterface {
 	return &fakeConfigMaps{configMaps: f.configMaps, createErr: f.configMapCreateErr}
+}
+
+// Pods lets tests drive an RPC past the point where it launches a provisioner
+// pod: the RPC fails with an ordinary error instead of dereferencing the
+// unimplemented embedded interface.
+func (f *fakeCoreV1) Pods(_ string) corev1.PodInterface {
+	return &fakePods{}
+}
+
+type fakePods struct {
+	corev1.PodInterface
+}
+
+func (f *fakePods) Create(_ context.Context, _ *v1.Pod, _ metav1.CreateOptions) (*v1.Pod, error) {
+	return nil, errors.New("the fake client does not run provisioner pods")
 }
 
 type fakePersistentVolumes struct {
@@ -389,7 +405,7 @@ func TestDeleteDynamicSnapshotFallsBackToRecordedLocation(t *testing.T) {
 			if test.volume != nil {
 				cs.kubeClient.(*fakeKubeClient).volumes[test.volume.Name] = test.volume
 			}
-			if err := cs.recordSnapshotLocation(ctx, "snapshot-id", "recorded-node", "recorded-vg"); err != nil {
+			if err := cs.recordSnapshotLocation(ctx, "snapshot-id", "recorded-node", "recorded-vg", false); err != nil {
 				t.Fatalf("failed to record snapshot location: %v", err)
 			}
 
@@ -448,7 +464,7 @@ func TestPreExistingSnapshotResolvesLocation(t *testing.T) {
 	}
 
 	content.Annotations = nil
-	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "recorded-node", "recorded-vg"); err != nil {
+	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "recorded-node", "recorded-vg", false); err != nil {
 		t.Fatalf("failed to record snapshot location: %v", err)
 	}
 	action, err = cs.deleteSnapshotAction(context.Background(), "snapshot-id", content)
@@ -477,14 +493,14 @@ func TestSnapshotLocationRecordLifecycle(t *testing.T) {
 	ctx := context.Background()
 	handle := "snapshot/with unicode 雪 and characters + not valid in a ConfigMap key"
 	name := snapshotLocationConfigMapName(handle)
-	if err := cs.recordSnapshotLocation(ctx, handle, "node-a", "--config"); status.Code(err) != codes.FailedPrecondition {
+	if err := cs.recordSnapshotLocation(ctx, handle, "node-a", "--config", false); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected an option-like volume group to return FailedPrecondition, got %v", err)
 	}
 
 	if name == handle || len(name) > 253 {
 		t.Fatalf("snapshot location name is not a safe derived name: %q", name)
 	}
-	if err := cs.recordSnapshotLocation(ctx, handle, "node-a", "vg-a"); err != nil {
+	if err := cs.recordSnapshotLocation(ctx, handle, "node-a", "vg-a", false); err != nil {
 		t.Fatalf("recordSnapshotLocation failed: %v", err)
 	}
 	location := cs.kubeClient.(*fakeKubeClient).configMaps[name]
@@ -493,16 +509,19 @@ func TestSnapshotLocationRecordLifecycle(t *testing.T) {
 	}
 	// CreateSnapshot is idempotent, so recording the same location again must be
 	// idempotent as well.
-	if err := cs.recordSnapshotLocation(ctx, handle, "node-a", "vg-a"); err != nil {
+	if err := cs.recordSnapshotLocation(ctx, handle, "node-a", "vg-a", false); err != nil {
 		t.Fatalf("idempotent recordSnapshotLocation failed: %v", err)
 	}
 
-	nodeName, vgName, found, err := cs.lookupSnapshotLocation(ctx, handle)
-	if err != nil || !found || nodeName != "node-a" || vgName != "vg-a" {
-		t.Fatalf("lookupSnapshotLocation = (%q, %q, %t, %v)", nodeName, vgName, found, err)
+	recorded, found, err := cs.lookupSnapshotLocation(ctx, handle)
+	if err != nil || !found || recorded.nodeName != "node-a" || recorded.vgName != "vg-a" {
+		t.Fatalf("lookupSnapshotLocation = (%#v, %t, %v)", recorded, found, err)
+	}
+	if recorded.encrypted != "false" {
+		t.Fatalf("expected the record to persist the source encryption state, got %q", recorded.encrypted)
 	}
 
-	err = cs.recordSnapshotLocation(ctx, handle, "node-b", "vg-b")
+	err = cs.recordSnapshotLocation(ctx, handle, "node-b", "vg-b", false)
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("expected AlreadyExists for a conflicting location record, got %v", err)
 	}
@@ -512,7 +531,7 @@ func TestSnapshotLocationRecordLifecycle(t *testing.T) {
 	if err := cs.forgetSnapshotLocation(ctx, handle); err != nil {
 		t.Fatalf("forgetSnapshotLocation failed: %v", err)
 	}
-	if _, _, found, err := cs.lookupSnapshotLocation(ctx, handle); err != nil || found {
+	if _, found, err := cs.lookupSnapshotLocation(ctx, handle); err != nil || found {
 		t.Fatalf("expected forgotten location to be absent, found=%t err=%v", found, err)
 	}
 	if err := cs.forgetSnapshotLocation(ctx, handle); err != nil {
@@ -535,14 +554,14 @@ func TestSnapshotLocationRejectsMalformedRecord(t *testing.T) {
 	}
 	cs.kubeClient.(*fakeKubeClient).configMaps[snapshotLocationConfigMapName(handle)] = configMap
 
-	if _, _, _, err := cs.lookupSnapshotLocation(context.Background(), handle); err == nil {
+	if _, _, err := cs.lookupSnapshotLocation(context.Background(), handle); err == nil {
 		t.Fatal("expected an incomplete location record to fail")
 	}
 	configMap.Data[snapshotLocationVGKey] = "--config"
-	if _, _, _, err := cs.lookupSnapshotLocation(context.Background(), handle); err == nil {
+	if _, _, err := cs.lookupSnapshotLocation(context.Background(), handle); err == nil {
 		t.Fatal("expected a location record with an option-like volume group to fail")
 	}
-	if err := cs.recordSnapshotLocation(context.Background(), handle, "node-a", "vg-a"); status.Code(err) != codes.FailedPrecondition {
+	if err := cs.recordSnapshotLocation(context.Background(), handle, "node-a", "vg-a", false); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for an invalid location record, got %v", err)
 	}
 }
@@ -551,7 +570,7 @@ func TestSnapshotLocationReturnsUnavailableForAPIFailure(t *testing.T) {
 	cs := controllerWithFakeClients()
 	cs.kubeClient.(*fakeKubeClient).configMapCreateErr = k8serror.NewServiceUnavailable("API server unavailable")
 
-	err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg-a")
+	err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg-a", false)
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected Unavailable for an API failure, got %v", err)
 	}
@@ -653,7 +672,7 @@ func TestPreProvisionedSnapshotCloneAction(t *testing.T) {
 
 func TestPreProvisionedSnapshotCloneActionUsesRecordedLocation(t *testing.T) {
 	cs := controllerWithFakeClients()
-	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "source-vg"); err != nil {
+	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "source-vg", false); err != nil {
 		t.Fatalf("recordSnapshotLocation failed: %v", err)
 	}
 	zeroSize := int64(0)
@@ -783,5 +802,361 @@ func TestCloneFromDynamicSnapshotRejectsIncompleteStatus(t *testing.T) {
 	)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+// lvmPersistentVolume builds a PV the way the controller records one, so the
+// restore-validation paths can read back node, VG, size and encryption state.
+func lvmPersistentVolume(name, node, vgName string, encrypted bool) *v1.PersistentVolume {
+	attributes := map[string]string{
+		"type":          DmThinType,
+		"vgName":        vgName,
+		"RequiredBytes": "1073741824",
+	}
+	if encrypted {
+		attributes[encryptedParam] = "true"
+	}
+	return &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				CSI: &v1.CSIPersistentVolumeSource{VolumeAttributes: attributes},
+			},
+			NodeAffinity: &v1.VolumeNodeAffinity{
+				Required: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{{
+						MatchExpressions: []v1.NodeSelectorRequirement{{
+							Key:      topologyKeyNode,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{node},
+						}},
+					}},
+				},
+			},
+		},
+	}
+}
+
+func volumeContentSource(volumeID string) *csi.VolumeContentSource {
+	return &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+		Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: volumeID},
+	}}
+}
+
+func snapshotContentSource(snapshotID string) *csi.VolumeContentSource {
+	return &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
+		Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapshotID},
+	}}
+}
+
+func luksSecret() map[string]string {
+	return map[string]string{cryptoKeyValue: "source-passphrase"}
+}
+
+// A restore is a block-level clone, so it cannot convert encryption state.
+// Both mismatch directions have to be refused before any LV is created:
+// unencrypted -> encrypted would LUKS-format restored data, and
+// encrypted -> unencrypted would expose the raw LUKS container.
+func TestValidateRestoreEncryptionRejectsStateMismatch(t *testing.T) {
+	tests := []struct {
+		name         string
+		srcEncrypted bool
+		dstEncrypted bool
+		secrets      map[string]string
+		wantCode     codes.Code
+	}{
+		{name: "plain to plain", wantCode: codes.OK},
+		{
+			name:         "encrypted to encrypted",
+			srcEncrypted: true,
+			dstEncrypted: true,
+			secrets:      luksSecret(),
+			wantCode:     codes.OK,
+		},
+		{name: "plain to encrypted", dstEncrypted: true, secrets: luksSecret(), wantCode: codes.InvalidArgument},
+		{name: "encrypted to plain", srcEncrypted: true, wantCode: codes.InvalidArgument},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := controllerWithFakeClients()
+			cs.kubeClient.(*fakeKubeClient).volumes["source"] = lvmPersistentVolume("source", "node-a", "vg", tt.srcEncrypted)
+
+			err := cs.validateRestoreEncryption(
+				context.Background(),
+				volumeContentSource("source"),
+				tt.dstEncrypted,
+				tt.secrets,
+			)
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("expected %v, got %v", tt.wantCode, err)
+			}
+		})
+	}
+}
+
+// The restored LV keeps its source's LUKS header, so only the source's
+// passphrase can open it. Missing credentials must fail in CreateVolume with an
+// actionable message instead of surfacing much later on the node.
+func TestValidateRestoreEncryptionRequiresCredential(t *testing.T) {
+	tests := []struct {
+		name    string
+		secrets map[string]string
+	}{
+		{name: "no secret at all"},
+		{name: "empty secret", secrets: map[string]string{}},
+		{name: "secret without passphrase", secrets: map[string]string{cryptoKeyCipher: "aes-xts-plain64"}},
+		{name: "empty passphrase", secrets: map[string]string{cryptoKeyValue: ""}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := controllerWithFakeClients()
+			cs.kubeClient.(*fakeKubeClient).volumes["source"] = lvmPersistentVolume("source", "node-a", "vg", true)
+
+			err := cs.validateRestoreEncryption(context.Background(), volumeContentSource("source"), true, tt.secrets)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("expected InvalidArgument, got %v", err)
+			}
+			if !strings.Contains(err.Error(), cryptoKeyValue) {
+				t.Fatalf("error should name the missing secret field: %v", err)
+			}
+		})
+	}
+}
+
+// The credential error must stay useful without echoing anything secret.
+func TestValidateRestoreEncryptionErrorDoesNotLeakSecrets(t *testing.T) {
+	const passphrase = "super-secret-passphrase"
+	cs := controllerWithFakeClients()
+	cs.kubeClient.(*fakeKubeClient).volumes["source"] = lvmPersistentVolume("source", "node-a", "vg", false)
+
+	err := cs.validateRestoreEncryption(
+		context.Background(),
+		volumeContentSource("source"),
+		true,
+		map[string]string{cryptoKeyValue: passphrase},
+	)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+	if strings.Contains(err.Error(), passphrase) {
+		t.Fatalf("passphrase leaked into the error: %v", err)
+	}
+}
+
+// CreateVolume is the gate an unsafe restore has to pass, so assert the
+// rejection there and not only in the helper.
+func TestCreateVolumeRejectsUnencryptedRestoreIntoEncryptedClass(t *testing.T) {
+	cs := controllerWithFakeClients()
+	cs.kubeClient.(*fakeKubeClient).volumes["source"] = lvmPersistentVolume("source", "node-a", "vg", false)
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "destination",
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
+		VolumeCapabilities: []*csi.VolumeCapability{mountCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)},
+		Parameters: map[string]string{
+			"type":         DmThinType,
+			"vgName":       "vg",
+			encryptedParam: "true",
+		},
+		Secrets:             luksSecret(),
+		VolumeContentSource: volumeContentSource("source"),
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Preferred: []*csi.Topology{{Segments: map[string]string{topologyKeyNode: "node-a"}}},
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+}
+
+// Snapshot restores resolve the source state from the still-present source PV.
+func TestSnapshotRestoreEncryptionStateFromSourceVolume(t *testing.T) {
+	cs := controllerWithFakeClients()
+	cs.kubeClient.(*fakeKubeClient).volumes["source"] = lvmPersistentVolume("source", "node-a", "vg", true)
+	cs.snapClient = &fakeSnapshotClient{contents: []snapv1.VolumeSnapshotContent{{
+		ObjectMeta: metav1.ObjectMeta{Name: "dynamic"},
+		Spec: snapv1.VolumeSnapshotContentSpec{
+			Source: snapv1.VolumeSnapshotContentSource{VolumeHandle: strPointer("source")},
+		},
+		Status: &snapv1.VolumeSnapshotContentStatus{SnapshotHandle: strPointer("snapshot-id")},
+	}}}
+
+	ctx := context.Background()
+	if err := cs.validateRestoreEncryption(ctx, snapshotContentSource("snapshot-id"), true, luksSecret()); err != nil {
+		t.Fatalf("encrypted snapshot into an encrypted class must be allowed, got %v", err)
+	}
+	if err := cs.validateRestoreEncryption(ctx, snapshotContentSource("snapshot-id"), false, nil); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for an encrypted snapshot into a plain class, got %v", err)
+	}
+}
+
+// When the source PV is gone the recorded (non-secret) encryption state, or an
+// explicit annotation, has to carry the decision.
+func TestSnapshotRestoreEncryptionStateWithoutSourceVolume(t *testing.T) {
+	newController := func(t *testing.T, content snapv1.VolumeSnapshotContent) *controllerServer {
+		t.Helper()
+		cs := controllerWithFakeClients()
+		cs.snapClient = &fakeSnapshotClient{contents: []snapv1.VolumeSnapshotContent{content}}
+		return cs
+	}
+	preProvisioned := snapv1.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: "pre-provisioned"},
+		Spec: snapv1.VolumeSnapshotContentSpec{
+			Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer("snapshot-id")},
+		},
+	}
+
+	t.Run("recorded state blocks a mismatched restore", func(t *testing.T) {
+		cs := newController(t, preProvisioned)
+		if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg", true); err != nil {
+			t.Fatalf("recordSnapshotLocation failed: %v", err)
+		}
+		err := cs.validateRestoreEncryption(context.Background(), snapshotContentSource("snapshot-id"), false, nil)
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("expected InvalidArgument, got %v", err)
+		}
+	})
+
+	t.Run("recorded state allows a matching restore", func(t *testing.T) {
+		cs := newController(t, preProvisioned)
+		if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg", true); err != nil {
+			t.Fatalf("recordSnapshotLocation failed: %v", err)
+		}
+		if err := cs.validateRestoreEncryption(context.Background(), snapshotContentSource("snapshot-id"), true, luksSecret()); err != nil {
+			t.Fatalf("matching encrypted restore failed: %v", err)
+		}
+	})
+
+	t.Run("annotation overrides the record", func(t *testing.T) {
+		annotated := *preProvisioned.DeepCopy()
+		annotated.Annotations = map[string]string{snapshotEncryptedAnnotation: "false"}
+		cs := newController(t, annotated)
+		if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg", true); err != nil {
+			t.Fatalf("recordSnapshotLocation failed: %v", err)
+		}
+		if err := cs.validateRestoreEncryption(context.Background(), snapshotContentSource("snapshot-id"), false, nil); err != nil {
+			t.Fatalf("annotation-declared plain snapshot into a plain class failed: %v", err)
+		}
+	})
+
+	t.Run("malformed annotation is rejected", func(t *testing.T) {
+		annotated := *preProvisioned.DeepCopy()
+		annotated.Annotations = map[string]string{snapshotEncryptedAnnotation: "maybe"}
+		cs := newController(t, annotated)
+		err := cs.validateRestoreEncryption(context.Background(), snapshotContentSource("snapshot-id"), false, nil)
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("expected FailedPrecondition, got %v", err)
+		}
+	})
+}
+
+// Location records written before encryption support carry no state. Restoring
+// them into a plain class stays allowed (nothing formats, and the node still
+// checks for a stray LUKS header); into an encrypted class it must be refused.
+func TestSnapshotRestoreEncryptionStateUnknownForLegacyRecord(t *testing.T) {
+	newController := func() *controllerServer {
+		cs := controllerWithFakeClients()
+		cs.snapClient = &fakeSnapshotClient{contents: []snapv1.VolumeSnapshotContent{{
+			ObjectMeta: metav1.ObjectMeta{Name: "pre-provisioned"},
+			Spec: snapv1.VolumeSnapshotContentSpec{
+				Source: snapv1.VolumeSnapshotContentSource{SnapshotHandle: strPointer("snapshot-id")},
+			},
+		}}}
+		name := snapshotLocationConfigMapName("snapshot-id")
+		cs.kubeClient.(*fakeKubeClient).configMaps[name] = &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{snapshotLocationLabel: "true"},
+			},
+			Data: map[string]string{
+				snapshotLocationHandleKey: "snapshot-id",
+				snapshotLocationNodeKey:   "node-a",
+				snapshotLocationVGKey:     "vg",
+			},
+		}
+		return cs
+	}
+
+	if err := newController().validateRestoreEncryption(
+		context.Background(),
+		snapshotContentSource("snapshot-id"),
+		false,
+		nil,
+	); err != nil {
+		t.Fatalf("legacy record into a plain class must stay allowed, got %v", err)
+	}
+
+	err := newController().validateRestoreEncryption(
+		context.Background(),
+		snapshotContentSource("snapshot-id"),
+		true,
+		luksSecret(),
+	)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for an unknown source state, got %v", err)
+	}
+}
+
+// A legacy record must not make an otherwise idempotent CreateSnapshot retry
+// fail just because it now also records the encryption state.
+func TestRecordSnapshotLocationToleratesLegacyRecordWithoutEncryptionState(t *testing.T) {
+	cs := controllerWithFakeClients()
+	name := snapshotLocationConfigMapName("snapshot-id")
+	cs.kubeClient.(*fakeKubeClient).configMaps[name] = &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: map[string]string{snapshotLocationLabel: "true"},
+		},
+		Data: map[string]string{
+			snapshotLocationHandleKey: "snapshot-id",
+			snapshotLocationNodeKey:   "node-a",
+			snapshotLocationVGKey:     "vg",
+		},
+	}
+
+	if err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg", true); err != nil {
+		t.Fatalf("legacy record must not break an idempotent re-record: %v", err)
+	}
+
+	err := cs.recordSnapshotLocation(context.Background(), "snapshot-id", "node-a", "vg", false)
+	if err != nil {
+		t.Fatalf("legacy record must not break an idempotent re-record: %v", err)
+	}
+}
+
+// A genuine disagreement about encryption state is a conflict, not a retry.
+func TestRecordSnapshotLocationRejectsConflictingEncryptionState(t *testing.T) {
+	cs := controllerWithFakeClients()
+	ctx := context.Background()
+	if err := cs.recordSnapshotLocation(ctx, "snapshot-id", "node-a", "vg", true); err != nil {
+		t.Fatalf("recordSnapshotLocation failed: %v", err)
+	}
+	err := cs.recordSnapshotLocation(ctx, "snapshot-id", "node-a", "vg", false)
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("expected AlreadyExists, got %v", err)
+	}
+}
+
+// CreateSnapshot has to persist the source's encryption state so a later
+// restore can validate the destination even after the source PV is gone.
+func TestCreateSnapshotRecordsEncryptionState(t *testing.T) {
+	cs := controllerWithFakeClients()
+	cs.kubeClient.(*fakeKubeClient).volumes["source"] = lvmPersistentVolume("source", "node-a", "vg", true)
+
+	// createSnapshotterPod needs a live cluster, so the RPC fails after the
+	// record is written; only the record is under test here.
+	_, _ = cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		Name:           "snapshot-id",
+		SourceVolumeId: "source",
+	})
+
+	recorded, found, err := cs.lookupSnapshotLocation(context.Background(), "snapshot-id")
+	if err != nil || !found {
+		t.Fatalf("lookupSnapshotLocation = (%#v, %t, %v)", recorded, found, err)
+	}
+	if recorded.encrypted != "true" {
+		t.Fatalf("expected the record to persist encryption state \"true\", got %q", recorded.encrypted)
 	}
 }

@@ -18,6 +18,7 @@ package lvm
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,6 +33,13 @@ const (
 	// context via buildVolumeContext) that opts a volume into LUKS2 encryption
 	// at rest.
 	encryptedParam = "encrypted"
+
+	// restoredFromSourceKey is set by the controller in the volume context (and
+	// therefore in the PersistentVolume's volumeAttributes) when a volume was
+	// populated from a snapshot or volume content source instead of being
+	// created empty. The node plugin refuses to LUKS-format such a volume: the
+	// restored blocks are real data, and formatting would destroy them.
+	restoredFromSourceKey = "restoredFromSource"
 
 	// Longhorn / Kubernetes CSI encryption-secret convention. Harvester's
 	// admission webhook (harvester-webhook) validates that any StorageClass
@@ -60,8 +68,29 @@ const (
 	cryptMapperPrefix = "csi-lvm-"
 
 	// cryptsetup exit codes we care about. See cryptsetup(8) EXIT STATUS.
-	cryptExitNotLuks  = 1 // isLuks: device does not carry a LUKS header
-	cryptExitInactive = 4 // status: no such active mapping
+	cryptExitNotLuks      = 1 // isLuks: device does not carry a LUKS header
+	cryptExitNoPermission = 2 // luksOpen: no key available with this passphrase
+	cryptExitInactive     = 4 // status: no such active mapping
+)
+
+// Restore-safety errors. They are values rather than formatted strings so the
+// node server can map them onto FailedPrecondition (an operator has to fix the
+// StorageClass or the secret) instead of a generic, retried Internal error.
+var (
+	// errRestoredVolumeNotLuks fires when an encrypted StorageClass receives a
+	// volume restored from an unencrypted source. Formatting here would write a
+	// LUKS header over the restored filesystem, so the restore is refused.
+	errRestoredVolumeNotLuks = errors.New(
+		"volume was restored from an unencrypted source but its StorageClass requests encryption; " +
+			"refusing to LUKS-format restored data")
+
+	// errBadPassphrase fires when the supplied secret does not unlock an
+	// existing LUKS header. A restored volume keeps the header of its source, so
+	// this is the expected failure when the restored PVC references a secret
+	// holding a different passphrase.
+	errBadPassphrase = errors.New(
+		"the encryption secret does not unlock this volume; a volume restored from an encrypted " +
+			"snapshot keeps the LUKS header of its source and needs that source's passphrase")
 )
 
 // cryptExecutor runs cryptsetup with the passphrase supplied on stdin so it
@@ -108,6 +137,14 @@ func isEncrypted(volumeContext map[string]string) bool {
 	}
 	enabled, err := strconv.ParseBool(value)
 	return err == nil && enabled
+}
+
+// isRestoredFromSource reports whether the volume was populated from a snapshot
+// or volume content source. Only the controller sets the flag, so a missing or
+// malformed value is treated as "created empty".
+func isRestoredFromSource(volumeContext map[string]string) bool {
+	restored, err := strconv.ParseBool(volumeContext[restoredFromSourceKey])
+	return err == nil && restored
 }
 
 // luks2HeaderBytes is the space cryptsetup's default LUKS2 format reserves ahead
@@ -187,10 +224,15 @@ func valueOrDefault(value, fallback string) string {
 }
 
 // openEncryptedDevice ensures the block device at devicePath carries a LUKS2
-// header (formatting it on first use) and opens it, returning the resulting
-// /dev/mapper path to be mounted or bind-mounted. It is idempotent: a device
-// that is already open is reused, so repeated NodePublishVolume calls are safe.
-func openEncryptedDevice(devicePath, volID string, params *cryptoParams) (string, error) {
+// header and opens it, returning the resulting /dev/mapper path to be mounted
+// or bind-mounted. It is idempotent: a device that is already open is reused,
+// so repeated NodePublishVolume calls are safe.
+//
+// allowFormat must be false for volumes restored from a snapshot or volume
+// content source. Those already hold data, so a missing LUKS header means the
+// source was unencrypted and formatting would destroy the restored content;
+// openEncryptedDevice fails with errRestoredVolumeNotLuks instead.
+func openEncryptedDevice(devicePath, volID string, params *cryptoParams, allowFormat bool) (string, error) {
 	executor := newCryptExecutor()
 	mapperName := cryptMapperName(volID)
 	mapperPath := cryptMapperPath(volID)
@@ -206,6 +248,9 @@ func openEncryptedDevice(devicePath, volID string, params *cryptoParams) (string
 		return "", err
 	}
 	if !formatted {
+		if !allowFormat {
+			return "", fmt.Errorf("%w (device %s)", errRestoredVolumeNotLuks, devicePath)
+		}
 		klog.Infof("formatting %s as LUKS2 for encrypted volume %s", devicePath, volID)
 		if out, err := luksFormat(executor, devicePath, params); err != nil {
 			return "", fmt.Errorf("unable to LUKS-format %s: %w output:%s", devicePath, err, out)
@@ -213,10 +258,22 @@ func openEncryptedDevice(devicePath, volID string, params *cryptoParams) (string
 	}
 
 	if out, err := luksOpen(executor, devicePath, mapperName, params.passphrase); err != nil {
+		if code, ok := commandExitCode(err); ok && code == cryptExitNoPermission {
+			// Deliberately drops cryptsetup's output: it adds nothing beyond
+			// "No key available with this passphrase" and keeps the error clean.
+			return "", fmt.Errorf("%w (device %s)", errBadPassphrase, devicePath)
+		}
 		return "", fmt.Errorf("unable to open LUKS device %s: %w output:%s", devicePath, err, out)
 	}
 	klog.Infof("opened dm-crypt device %s for volume %s", mapperName, volID)
 	return mapperPath, nil
+}
+
+// luksHeaderPresent reports whether a block device already carries a LUKS
+// header. Used to keep a volume restored from an encrypted source from being
+// handed to a workload as a raw, still-locked LUKS container.
+func luksHeaderPresent(devicePath string) (bool, error) {
+	return isLuks(newCryptExecutor(), devicePath)
 }
 
 // closeEncryptedDevice tears down the dm-crypt mapping for a volume. It is
