@@ -1,0 +1,83 @@
+# Encrypted-at-rest dm-thin StorageClass (LUKS2 / dm-crypt).
+#
+# Each volume provisioned from this class is LUKS2-formatted and opened as a
+# dm-crypt device on the node at NodePublishVolume, so all data written to the
+# backing logical volume is encrypted at rest. The passphrase and LUKS tuning
+# are supplied via a CSI secret that follows the same CRYPTO_KEY_* convention as
+# Longhorn encrypted volumes, so the Harvester webhook and UI accept it
+# unchanged. The passphrase is fed to cryptsetup over stdin, never via argv.
+#
+# IMPORTANT:
+# - The referenced secret must contain CRYPTO_KEY_VALUE (the passphrase). The
+#   remaining CRYPTO_KEY_* fields are optional tuning knobs for this driver;
+#   when omitted it applies Longhorn's defaults (aes-xts-plain64 / sha256 / 256
+#   / argon2i). Harvester's own StorageClass webhook is stricter and wants all
+#   of them present and non-empty, as below.
+# - Losing the passphrase means the data is unrecoverable.
+# - All four secret references are set. node-stage-secret-* is required by
+#   Harvester's webhook on any encrypted StorageClass, but this driver never
+#   reads it: it advertises STAGE_UNSTAGE_VOLUME while its NodeStageVolume only
+#   validates the request, and the dm-crypt mapping is opened at
+#   NodePublishVolume. node-expand-secret-* IS used:
+#   growing the filesystem means resizing the dm-crypt mapper first, and without
+#   it expansion fails with "expand is missing its passphrase secret".
+# - The secret reference here is static. ${pvc.name}/${pvc.namespace} templating
+#   works on upstream Kubernetes and gives every PVC its own key, but Harvester's
+#   webhook resolves the reference literally at StorageClass-admission time and
+#   rejects a class whose secret does not already exist - so on Harvester use a
+#   static reference, or one StorageClass per key.
+# - RESTORES (from a snapshot or a clone source) are block-level copies, so the
+#   destination inherits the source's LUKS header and can only be opened with
+#   the SOURCE's passphrase. Restoring through a StorageClass that references a
+#   different key fails at NodePublishVolume with FailedPrecondition. Restoring
+#   across an encryption-state mismatch (unencrypted source into this class, or
+#   an encrypted source into a plain class) is rejected at CreateVolume.
+allowVolumeExpansion: true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lvm-dm-thin-encrypted
+  annotations:
+    # Clone via host-assisted copy, not snapshot smart-clone. Cloning an
+    # unencrypted source (e.g. a VM image) into this class must write the data
+    # THROUGH the target's dm-crypt mapper so it lands encrypted; a block-level
+    # smart-clone would bypass LUKS. Required for CDI image clones on Harvester.
+    cdi.harvesterhci.io/storageProfileCloneStrategy: copy
+parameters:
+  type: dm-thin
+  vgName: vg01
+  encrypted: "true"
+  csi.storage.k8s.io/provisioner-secret-name: lvm-luks
+  csi.storage.k8s.io/provisioner-secret-namespace: default
+  csi.storage.k8s.io/node-stage-secret-name: lvm-luks
+  csi.storage.k8s.io/node-stage-secret-namespace: default
+  csi.storage.k8s.io/node-publish-secret-name: lvm-luks
+  csi.storage.k8s.io/node-publish-secret-namespace: default
+  csi.storage.k8s.io/node-expand-secret-name: lvm-luks
+  csi.storage.k8s.io/node-expand-secret-namespace: default
+provisioner: lvm.driver.harvesterhci.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowedTopologies:
+- matchLabelExpressions:
+  - key: topology.lvm.csi/node
+    values:
+    - <target node name>
+---
+# The encryption secret the StorageClass above points at. It must exist before
+# the StorageClass is created on Harvester.
+# In production, generate a strong random passphrase and manage it out of band
+# (e.g. sealed-secrets, external-secrets, or a KMS-backed provider).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lvm-luks
+  namespace: default
+type: Opaque
+stringData:
+  CRYPTO_KEY_VALUE: "replace-with-a-strong-random-passphrase"
+  CRYPTO_KEY_PROVIDER: "secret"
+  CRYPTO_KEY_CIPHER: "aes-xts-plain64"
+  CRYPTO_KEY_HASH: "sha256"
+  CRYPTO_KEY_SIZE: "256"
+  CRYPTO_PBKDF: "argon2i"

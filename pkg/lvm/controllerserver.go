@@ -19,6 +19,7 @@ package lvm
 import (
 	"crypto/sha256"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -50,13 +51,51 @@ type controllerServer struct {
 const (
 	snapshotNodeAnnotation = "lvm.driver.harvesterhci.io/nodeName"
 	snapshotVGAnnotation   = "lvm.driver.harvesterhci.io/vgName"
+	// snapshotEncryptedAnnotation lets an administrator declare the encryption
+	// state of a pre-provisioned snapshot whose location record is gone, the
+	// same way the node/VG annotations declare its physical location.
+	snapshotEncryptedAnnotation = "lvm.driver.harvesterhci.io/encrypted"
 
 	snapshotLocationConfigMapPrefix = "csi-lvm-snapshot-location-"
 	snapshotLocationLabel           = "lvm.driver.harvesterhci.io/snapshot-location"
 	snapshotLocationHandleKey       = "snapshotHandle"
 	snapshotLocationNodeKey         = "nodeName"
 	snapshotLocationVGKey           = "vgName"
+	// snapshotLocationEncryptedKey persists the (non-secret) encryption state of
+	// the source volume so a restore can tell whether the snapshot's blocks
+	// carry a LUKS header. Records written before encryption support omit it.
+	snapshotLocationEncryptedKey = "encrypted"
 )
+
+// sourceEncryption is the encryption state of a restore source. It has to be a
+// tri-state: snapshot location records written before encryption support exist
+// in the wild and carry no encryption state at all, which is different from
+// knowing the source was plain.
+type sourceEncryption int
+
+const (
+	sourceEncryptionUnknown sourceEncryption = iota
+	sourceEncryptionPlain
+	sourceEncryptionEncrypted
+)
+
+func (s sourceEncryption) String() string {
+	switch s {
+	case sourceEncryptionPlain:
+		return "unencrypted"
+	case sourceEncryptionEncrypted:
+		return "encrypted"
+	default:
+		return "unknown"
+	}
+}
+
+func encryptionStateOf(encrypted bool) sourceEncryption {
+	if encrypted {
+		return sourceEncryptionEncrypted
+	}
+	return sourceEncryptionPlain
+}
 
 // NewControllerServer
 func newControllerServer(nodeID string, hostWritePath string, namespace string, provisionerImage string, pullPolicy v1.PullPolicy) (*controllerServer, error) {
@@ -118,7 +157,8 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	volumeContext := buildVolumeContext(req.GetParameters(), requiredBytes)
+	source := req.GetVolumeContentSource()
+	volumeContext := buildVolumeContext(req.GetParameters(), requiredBytes, source != nil)
 
 	node, topology, err := topologyFromAccessibility(req.GetAccessibilityRequirements())
 	if err != nil {
@@ -126,7 +166,23 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	klog.Infof("creating volume %s on node: %s", req.GetName(), node)
 
-	if err := cs.provisionVolume(ctx, req, node, lvmType, vgName, requiredBytes); err != nil {
+	dstEncrypted := isEncrypted(req.GetParameters())
+
+	// Restores are block-level clones of the source LV, so the destination
+	// inherits the source's on-disk encryption state. Reject the combinations
+	// that would corrupt or expose data before any LV is created.
+	if source != nil {
+		if err := cs.validateRestoreEncryption(ctx, source, dstEncrypted, req.GetSecrets()); err != nil {
+			return nil, err
+		}
+	}
+
+	// Encrypted volumes lose the LUKS2 header (16 MiB) to overhead, so grow the
+	// backing LV by that much to still expose the requested capacity. The volume
+	// still reports its requested (usable) size below.
+	lvBytes := backingLVBytes(requiredBytes, dstEncrypted)
+
+	if err := cs.provisionVolume(ctx, req, node, lvmType, vgName, lvBytes); err != nil {
 		return nil, err
 	}
 
@@ -221,6 +277,168 @@ func (cs *controllerServer) cloneFromVolumeSource(
 		return status.Errorf(codes.Unavailable, "failed to get source volume %q: %v", volumeID, err)
 	}
 	return cs.cloneFromVolume(ctx, volume, dstName, dstNode, dstLVMType, dstVGName, dstSize)
+}
+
+// validateRestoreEncryption rejects restores whose source and destination
+// disagree about encryption, and makes a missing restore credential fail here
+// rather than later on the node.
+//
+// Both restore paths (snapshot and volume clone) copy the source LV block for
+// block, so the destination LV comes up carrying exactly the source's on-disk
+// layout. Restoring an unencrypted source into an encrypted StorageClass would
+// therefore hand the node a plain filesystem that NodePublishVolume must not
+// LUKS-format, and restoring an encrypted source into a plain StorageClass
+// would expose the raw LUKS container to the workload. Converting between the
+// two needs a copy that writes through a new dm-crypt mapper, which this driver
+// does not implement, so both directions are refused.
+func (cs *controllerServer) validateRestoreEncryption(
+	ctx context.Context,
+	source *csi.VolumeContentSource,
+	dstEncrypted bool,
+	secrets map[string]string,
+) error {
+	srcState, err := cs.sourceEncryptionState(ctx, source)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case srcState == encryptionStateOf(dstEncrypted):
+		// Matching states: nothing to convert.
+	case srcState == sourceEncryptionUnknown && !dstEncrypted:
+		// The destination never formats, and a LUKS container reaching a plain
+		// destination is still caught on the node before it is published.
+		klog.Warningf("restore source encryption state is unknown; continuing into an unencrypted StorageClass")
+	default:
+		return status.Errorf(
+			codes.InvalidArgument,
+			"cannot restore an %s source into an %s StorageClass: restores are block-level clones and "+
+				"cannot convert encryption state; restore into a StorageClass whose %q parameter matches the source",
+			srcState,
+			encryptionStateOf(dstEncrypted),
+			encryptedParam,
+		)
+	}
+
+	if !dstEncrypted {
+		return nil
+	}
+
+	// The restored LV keeps the source's LUKS header, so only the source's
+	// passphrase can open it. We cannot verify the passphrase from the
+	// controller (the header lives on the node), but we can fail early and
+	// explicitly when no usable credential reached us at all.
+	if _, err := extractCryptoParams(secrets); err != nil {
+		return status.Errorf(
+			codes.InvalidArgument,
+			"restoring into an encrypted StorageClass requires the source volume's passphrase: %v; "+
+				"the StorageClass must set csi.storage.k8s.io/provisioner-secret-name and the referenced "+
+				"secret must hold the passphrase the source was encrypted with (note that templated names "+
+				"such as ${pvc.name}-luks resolve to a different secret for the restored PVC)",
+			err,
+		)
+	}
+	return nil
+}
+
+// sourceEncryptionState resolves the encryption state of a restore source.
+func (cs *controllerServer) sourceEncryptionState(
+	ctx context.Context,
+	source *csi.VolumeContentSource,
+) (sourceEncryption, error) {
+	switch source.Type.(type) {
+	case *csi.VolumeContentSource_Volume:
+		volumeID := source.GetVolume().GetVolumeId()
+		if volumeID == "" {
+			return sourceEncryptionUnknown, status.Error(codes.InvalidArgument, "source volume ID is empty")
+		}
+		return cs.persistentVolumeEncryption(ctx, volumeID)
+	case *csi.VolumeContentSource_Snapshot:
+		snapshotID := source.GetSnapshot().GetSnapshotId()
+		if snapshotID == "" {
+			return sourceEncryptionUnknown, status.Error(codes.InvalidArgument, "source snapshot ID is empty")
+		}
+		content, err := cs.getSnapshotContent(ctx, snapshotID)
+		if err != nil {
+			return sourceEncryptionUnknown, err
+		}
+		if content == nil {
+			return sourceEncryptionUnknown, status.Errorf(codes.NotFound, "source snapshot %q not found", snapshotID)
+		}
+		return cs.snapshotEncryptionState(ctx, snapshotID, content)
+	default:
+		return sourceEncryptionUnknown, status.Errorf(codes.InvalidArgument, "%v not a proper volume source", source)
+	}
+}
+
+// snapshotEncryptionState prefers the still-present source volume, then the
+// content's annotation, then the location record written at CreateSnapshot.
+func (cs *controllerServer) snapshotEncryptionState(
+	ctx context.Context,
+	snapshotID string,
+	content *snapv1.VolumeSnapshotContent,
+) (sourceEncryption, error) {
+	if handle := content.Spec.Source.VolumeHandle; handle != nil && *handle != "" {
+		state, err := cs.persistentVolumeEncryption(ctx, *handle)
+		if err == nil {
+			return state, nil
+		}
+		if status.Code(err) != codes.NotFound {
+			return sourceEncryptionUnknown, err
+		}
+		klog.Warningf(
+			"source volume %s for snapshot %s is absent; falling back to recorded encryption state",
+			*handle,
+			snapshotID,
+		)
+	}
+
+	if annotation, ok := content.Annotations[snapshotEncryptedAnnotation]; ok {
+		encrypted, err := strconv.ParseBool(annotation)
+		if err != nil {
+			return sourceEncryptionUnknown, status.Errorf(
+				codes.FailedPrecondition,
+				"snapshot content %q has an invalid %q annotation %q",
+				content.Name,
+				snapshotEncryptedAnnotation,
+				annotation,
+			)
+		}
+		return encryptionStateOf(encrypted), nil
+	}
+
+	location, found, err := cs.recordedLocation(ctx, snapshotID)
+	if err != nil {
+		return sourceEncryptionUnknown, err
+	}
+	if !found || location.encrypted == "" {
+		return sourceEncryptionUnknown, nil
+	}
+	encrypted, err := strconv.ParseBool(location.encrypted)
+	if err != nil {
+		return sourceEncryptionUnknown, status.Errorf(
+			codes.FailedPrecondition,
+			"snapshot %q has an invalid recorded encryption state %q",
+			snapshotID,
+			location.encrypted,
+		)
+	}
+	return encryptionStateOf(encrypted), nil
+}
+
+func (cs *controllerServer) persistentVolumeEncryption(ctx context.Context, volumeID string) (sourceEncryption, error) {
+	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+	if k8serror.IsNotFound(err) {
+		return sourceEncryptionUnknown, status.Errorf(codes.NotFound, "source volume %q not found", volumeID)
+	}
+	if err != nil {
+		return sourceEncryptionUnknown, status.Errorf(codes.Unavailable, "failed to get source volume %q: %v", volumeID, err)
+	}
+	encrypted, err := encryptedFromPV(volume)
+	if err != nil {
+		return sourceEncryptionUnknown, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return encryptionStateOf(encrypted), nil
 }
 
 func (cs *controllerServer) newCreateVolumeAction(name, node, lvmType, vgName string, size int64) volumeAction {
@@ -610,10 +828,20 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 
+	// The snapshot is a block-level copy of the source LV, so it inherits the
+	// source's LUKS header (or lack of one). Record that state alongside the
+	// location so a restore can refuse mismatched destinations even when the
+	// source volume is long gone. This is non-secret metadata: it says whether
+	// the blocks are encrypted, never anything about the key.
+	encrypted, err := encryptedFromPV(volume)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
 	// Keep the physical location independently of the VolumeSnapshotContent. A
 	// Retain-policy content can be deleted and later re-created as a
 	// pre-provisioned content that only carries the opaque snapshot handle.
-	if err := cs.recordSnapshotLocation(ctx, snapshotName, nodeName, vgName); err != nil {
+	if err := cs.recordSnapshotLocation(ctx, snapshotName, nodeName, vgName, encrypted); err != nil {
 		return nil, err
 	}
 
@@ -778,7 +1006,7 @@ func (cs *controllerServer) resolvePreExistingSnapshotLocation(
 		return snapshotLocation{handle: snapshotID, nodeName: nodeName, vgName: vgName}, nil
 	}
 
-	nodeName, vgName, found, err := cs.lookupSnapshotLocation(ctx, snapshotID)
+	recorded, found, err := cs.lookupSnapshotLocation(ctx, snapshotID)
 	if err != nil {
 		return snapshotLocation{}, status.Errorf(codes.Unavailable, "failed to look up location for snapshot %q: %v", snapshotID, err)
 	}
@@ -791,7 +1019,7 @@ func (cs *controllerServer) resolvePreExistingSnapshotLocation(
 			snapshotVGAnnotation,
 		)
 	}
-	return snapshotLocation{handle: snapshotID, nodeName: nodeName, vgName: vgName}, nil
+	return recorded, nil
 }
 
 func (cs *controllerServer) deleteDynamicSnapshotAction(
@@ -884,7 +1112,7 @@ func (cs *controllerServer) recordedLocation(
 	ctx context.Context,
 	snapshotID string,
 ) (snapshotLocation, bool, error) {
-	nodeName, vgName, found, err := cs.lookupSnapshotLocation(ctx, snapshotID)
+	recorded, found, err := cs.lookupSnapshotLocation(ctx, snapshotID)
 	if err != nil {
 		return snapshotLocation{}, false, status.Errorf(
 			codes.Unavailable,
@@ -896,7 +1124,7 @@ func (cs *controllerServer) recordedLocation(
 	if !found {
 		return snapshotLocation{}, false, nil
 	}
-	return snapshotLocation{handle: snapshotID, nodeName: nodeName, vgName: vgName}, true, nil
+	return recorded, true, nil
 }
 
 func snapshotLocationConfigMapName(snapshotID string) string {
@@ -908,6 +1136,11 @@ type snapshotLocation struct {
 	handle   string
 	nodeName string
 	vgName   string
+	// encrypted is the source volume's encryption state as "true"/"false", or
+	// "" for records written before encryption support. It is deliberately
+	// non-secret metadata: it says whether the snapshot's blocks carry a LUKS
+	// header, never anything about the key.
+	encrypted string
 }
 
 func (location snapshotLocation) validate() error {
@@ -917,11 +1150,24 @@ func (location snapshotLocation) validate() error {
 	if err := validateVGName(location.vgName); err != nil {
 		return err
 	}
+	if location.encrypted != "" {
+		if _, err := strconv.ParseBool(location.encrypted); err != nil {
+			return fmt.Errorf("encryption state %q is not a boolean", location.encrypted)
+		}
+	}
 	return nil
 }
 
 func (location snapshotLocation) configMap(namespace string) *v1.ConfigMap {
 	immutable := true
+	data := map[string]string{
+		snapshotLocationHandleKey: location.handle,
+		snapshotLocationNodeKey:   location.nodeName,
+		snapshotLocationVGKey:     location.vgName,
+	}
+	if location.encrypted != "" {
+		data[snapshotLocationEncryptedKey] = location.encrypted
+	}
 	return &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      snapshotLocationConfigMapName(location.handle),
@@ -929,11 +1175,7 @@ func (location snapshotLocation) configMap(namespace string) *v1.ConfigMap {
 			Labels:    map[string]string{snapshotLocationLabel: "true"},
 		},
 		Immutable: &immutable,
-		Data: map[string]string{
-			snapshotLocationHandleKey: location.handle,
-			snapshotLocationNodeKey:   location.nodeName,
-			snapshotLocationVGKey:     location.vgName,
-		},
+		Data:      data,
 	}
 }
 
@@ -941,9 +1183,14 @@ func (location snapshotLocation) configMap(namespace string) *v1.ConfigMap {
 // object deliberately has no owner reference: it must outlive a
 // Retain-policy VolumeSnapshotContent so a later pre-provisioned content can
 // still resolve the backend location.
-func (cs *controllerServer) recordSnapshotLocation(ctx context.Context, snapshotID, nodeName, vgName string) error {
+func (cs *controllerServer) recordSnapshotLocation(ctx context.Context, snapshotID, nodeName, vgName string, encrypted bool) error {
 	configMapName := snapshotLocationConfigMapName(snapshotID)
-	desired := snapshotLocation{handle: snapshotID, nodeName: nodeName, vgName: vgName}
+	desired := snapshotLocation{
+		handle:    snapshotID,
+		nodeName:  nodeName,
+		vgName:    vgName,
+		encrypted: strconv.FormatBool(encrypted),
+	}
 	if err := desired.validate(); err != nil {
 		return status.Errorf(codes.FailedPrecondition,
 			"invalid location for snapshot %q (ConfigMap %q): %v", snapshotID, configMapName, err)
@@ -969,7 +1216,7 @@ func (cs *controllerServer) recordSnapshotLocation(ctx context.Context, snapshot
 		return status.Errorf(codes.FailedPrecondition,
 			"invalid location ConfigMap %q for snapshot %q: %v", configMapName, snapshotID, err)
 	}
-	if actual != desired {
+	if actual.nodeName != desired.nodeName || actual.vgName != desired.vgName {
 		return status.Errorf(
 			codes.AlreadyExists,
 			"snapshot %q location ConfigMap %q already records %q/%q, requested %q/%q",
@@ -981,26 +1228,39 @@ func (cs *controllerServer) recordSnapshotLocation(ctx context.Context, snapshot
 			desired.vgName,
 		)
 	}
+	// An empty recorded state means the record predates encryption support, not
+	// that the source was plain; only a real disagreement is a conflict. The
+	// ConfigMap is immutable, so the missing state cannot be backfilled here.
+	if actual.encrypted != "" && actual.encrypted != desired.encrypted {
+		return status.Errorf(
+			codes.AlreadyExists,
+			"snapshot %q location ConfigMap %q already records encryption state %q, requested %q",
+			snapshotID,
+			configMapName,
+			actual.encrypted,
+			desired.encrypted,
+		)
+	}
 	return nil
 }
 
 func (cs *controllerServer) lookupSnapshotLocation(
 	ctx context.Context,
 	snapshotID string,
-) (nodeName, vgName string, found bool, err error) {
+) (snapshotLocation, bool, error) {
 	name := snapshotLocationConfigMapName(snapshotID)
-	location, err := cs.kubeClient.CoreV1().ConfigMaps(cs.namespace).Get(ctx, name, metav1.GetOptions{})
+	configMap, err := cs.kubeClient.CoreV1().ConfigMaps(cs.namespace).Get(ctx, name, metav1.GetOptions{})
 	if k8serror.IsNotFound(err) {
-		return "", "", false, nil
+		return snapshotLocation{}, false, nil
 	}
 	if err != nil {
-		return "", "", false, err
+		return snapshotLocation{}, false, err
 	}
-	recorded, err := snapshotLocationFromConfigMap(location, snapshotID)
+	recorded, err := snapshotLocationFromConfigMap(configMap, snapshotID)
 	if err != nil {
-		return "", "", false, err
+		return snapshotLocation{}, false, err
 	}
-	return recorded.nodeName, recorded.vgName, true, nil
+	return recorded, true, nil
 }
 
 func snapshotLocationFromConfigMap(configMap *v1.ConfigMap, snapshotID string) (snapshotLocation, error) {
@@ -1011,9 +1271,10 @@ func snapshotLocationFromConfigMap(configMap *v1.ConfigMap, snapshotID string) (
 		return snapshotLocation{}, fmt.Errorf("ConfigMap %q is not a snapshot location record", configMap.Name)
 	}
 	recorded := snapshotLocation{
-		handle:   configMap.Data[snapshotLocationHandleKey],
-		nodeName: configMap.Data[snapshotLocationNodeKey],
-		vgName:   configMap.Data[snapshotLocationVGKey],
+		handle:    configMap.Data[snapshotLocationHandleKey],
+		nodeName:  configMap.Data[snapshotLocationNodeKey],
+		vgName:    configMap.Data[snapshotLocationVGKey],
+		encrypted: configMap.Data[snapshotLocationEncryptedKey],
 	}
 	if recorded.handle != snapshotID {
 		return snapshotLocation{}, fmt.Errorf(

@@ -18,10 +18,12 @@ package lvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -53,40 +55,119 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	// Resolve the block device to publish. For encrypted volumes this is the
+	// opened dm-crypt mapper; otherwise it is the bare logical volume.
+	devicePath := fmt.Sprintf("/dev/%s/%s", vgName, req.GetVolumeId())
+	encrypted := isEncrypted(req.GetVolumeContext())
+	// Volumes restored from a snapshot or clone already hold their source's
+	// blocks, so the encryption state on disk is the source's, not this
+	// StorageClass's. Both mismatch directions are rejected at CreateVolume; the
+	// checks below are the last line of defence for a volume that reached the
+	// node anyway (a hand-written PV, or a PV created before this validation).
+	restored := isRestoredFromSource(req.GetVolumeContext())
+	if encrypted {
+		params, perr := extractCryptoParams(req.GetSecrets())
+		if perr != nil {
+			return nil, status.Error(codes.InvalidArgument, perr.Error())
+		}
+		// allowFormat is false for restores: no LUKS header there means the
+		// source was unencrypted, and formatting would destroy restored data.
+		mapperPath, oerr := openEncryptedDevice(devicePath, req.GetVolumeId(), params, !restored)
+		if oerr != nil {
+			return nil, encryptedOpenError(req.GetVolumeId(), oerr)
+		}
+		devicePath = mapperPath
+	} else if shouldProbeForLuks(restored, req.GetVolumeCapability()) {
+		if err := rejectLuksContainer(devicePath, req.GetVolumeId()); err != nil {
+			return nil, err
+		}
+	}
+
 	if req.GetVolumeCapability().GetBlock() != nil {
-		err = ns.publishBlockVolume(req, vgName)
+		err = ns.publishBlockVolume(req, devicePath)
 	} else {
-		err = ns.publishFilesystemVolume(req, vgName)
+		err = ns.publishFilesystemVolume(req, devicePath)
 	}
 	if err != nil {
+		// Avoid leaking an open dm-crypt mapping if the mount step failed.
+		if encrypted {
+			if cerr := closeEncryptedDevice(req.GetVolumeId()); cerr != nil {
+				klog.Errorf("failed to close dm-crypt device for %s after publish error: %v", req.GetVolumeId(), cerr)
+			}
+		}
 		return nil, err
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) publishBlockVolume(req *csi.NodePublishVolumeRequest, vgName string) error {
-	output, err := bindMountLV(req.GetVolumeId(), req.GetTargetPath(), vgName, req.GetReadonly())
+// encryptedOpenError maps a failure to open the dm-crypt mapping onto a CSI
+// code. A wrong or missing passphrase and an unencrypted restore source are
+// configuration problems an operator has to fix, so they get FailedPrecondition
+// (which the CO surfaces without hiding it behind endless retries) instead of
+// the generic Internal used for transient cryptsetup failures.
+func encryptedOpenError(volID string, err error) error {
+	if errors.Is(err, errBadPassphrase) || errors.Is(err, errRestoredVolumeNotLuks) {
+		return status.Errorf(codes.FailedPrecondition, "unable to open encrypted volume %s: %v", volID, err)
+	}
+	return status.Errorf(codes.Internal, "unable to open encrypted volume %s: %v", volID, err)
+}
+
+// shouldProbeForLuks decides whether an unencrypted volume is checked for a
+// LUKS header before it is published. The driver formats and mounts a
+// filesystem volume itself, so a header on one is never legitimate: probe every
+// publish, which also covers a hand-written PV that never carried the restored
+// flag. A raw block volume is different - its workload may keep its own LUKS
+// header inside the volume - so there only a restore is checked.
+func shouldProbeForLuks(restored bool, capability *csi.VolumeCapability) bool {
+	return restored || capability.GetMount() != nil
+}
+
+// rejectLuksContainer stops a volume whose blocks carry a LUKS header - a
+// volume restored from an encrypted source, typically - from being published
+// through an unencrypted StorageClass. Without this the workload would be
+// handed the raw, still-locked container: a raw block volume would surface as
+// unreadable ciphertext, and a filesystem volume would be at the mercy of the
+// mount path's signature handling.
+func rejectLuksContainer(devicePath, volID string) error {
+	hasLuks, err := luksHeaderPresent(devicePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to probe %s for a LUKS header: %v", devicePath, err)
+	}
+	if hasLuks {
+		return status.Errorf(
+			codes.FailedPrecondition,
+			"volume %s carries a LUKS header but its StorageClass does not set %q=true; refusing to "+
+				"expose the raw LUKS container (a volume restored from an encrypted source keeps its "+
+				"source's header and can only be used through an encrypted StorageClass)",
+			volID,
+			encryptedParam,
+		)
+	}
+	return nil
+}
+
+func (ns *nodeServer) publishBlockVolume(req *csi.NodePublishVolumeRequest, devicePath string) error {
+	output, err := bindMountLV(devicePath, req.GetTargetPath(), req.GetReadonly())
 	if err != nil {
 		return fmt.Errorf("unable to bind mount lv: %w output:%s", err, output)
 	}
 	klog.Infof(
-		"block lv %s capability:%s vg:%s devices:%s created at:%s",
+		"block lv %s capability:%s device:%s devices:%s created at:%s",
 		req.GetVolumeId(),
 		req.GetVolumeCapability(),
-		vgName,
+		devicePath,
 		ns.devicesPattern,
 		req.GetTargetPath(),
 	)
 	return nil
 }
 
-func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest, vgName string) error {
+func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	mount := req.GetVolumeCapability().GetMount()
 	output, err := mountLV(
-		req.GetVolumeId(),
+		devicePath,
 		req.GetTargetPath(),
-		vgName,
 		mount.GetFsType(),
 		mount.GetMountFlags(),
 		req.GetReadonly(),
@@ -95,10 +176,10 @@ func (ns *nodeServer) publishFilesystemVolume(req *csi.NodePublishVolumeRequest,
 		return fmt.Errorf("unable to mount lv: %w output:%s", err, output)
 	}
 	klog.Infof(
-		"mounted lv %s capability:%s vg:%s devices:%s created at:%s",
+		"mounted lv %s capability:%s device:%s devices:%s created at:%s",
 		req.GetVolumeId(),
 		req.GetVolumeCapability(),
-		vgName,
+		devicePath,
 		ns.devicesPattern,
 		req.GetTargetPath(),
 	)
@@ -117,6 +198,13 @@ func (ns *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 	}
 	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "failed to remove target path %q: %v", targetPath, err)
+	}
+
+	// NodeUnpublishVolume carries no volume context or secrets, so we cannot
+	// tell here whether the volume was encrypted. closeEncryptedDevice is a
+	// no-op when no dm-crypt mapping exists, so it is safe to always attempt.
+	if err := closeEncryptedDevice(volID); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to close encrypted volume %s: %v", volID, err)
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -227,7 +315,9 @@ func (ns *nodeServer) NodeGetVolumeStats(_ context.Context, in *csi.NodeGetVolum
 }
 
 func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	klog.Infof("NodeExpandVolume: %s", req)
+	// StripSecrets keeps the node-expand-secret passphrase out of the logs for
+	// encrypted volumes (external-resizer populates req.Secrets for those).
+	klog.Infof("NodeExpandVolume: %s", protosanitizer.StripSecrets(req))
 	volID, volPath, capacity, err := validateNodeExpandRequest(req)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -238,9 +328,43 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	output, err := extendLVS(volID, uint64(capacity), isBlock, volPath) //nolint:gosec
+	// Expand requests carry no volume context, so probe for an open dm-crypt
+	// mapping to decide whether this is an encrypted volume.
+	encrypted, err := encryptedVolumeActive(volID)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "unable to expand volume %q: %v output: %s", volID, err, output)
+		return nil, status.Errorf(codes.Internal, "unable to inspect encrypted volume %q: %v", volID, err)
+	}
+
+	if !encrypted {
+		output, eerr := extendLVS(volID, uint64(capacity), isBlock, volPath) //nolint:gosec
+		if eerr != nil {
+			return nil, status.Errorf(codes.Internal, "unable to expand volume %s: %v output:%s", volID, eerr, output)
+		}
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: capacity}, nil
+	}
+
+	// Encrypted: the LUKS resize needs the passphrase, which reaches us only if
+	// the StorageClass wires csi.storage.k8s.io/node-expand-secret-name/-namespace
+	// so the external-resizer populates NodeExpandVolumeRequest.Secrets.
+	params, perr := extractCryptoParams(req.GetSecrets())
+	if perr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "encrypted volume %s expand is missing its passphrase secret (StorageClass needs a node-expand-secret): %v", volID, perr)
+	}
+
+	// Encrypted: grow the backing LV only (the filesystem, if any, lives on the
+	// dm-crypt mapper, not the bare LV), then grow the crypt mapping, then the
+	// filesystem on the mapper. Grow the LV by the LUKS2 header overhead so the
+	// decrypted device reaches the full requested capacity (matching create).
+	if output, eerr := extendLVS(volID, uint64(backingLVBytes(capacity, true)), true, volPath); eerr != nil { //nolint:gosec
+		return nil, status.Errorf(codes.Internal, "unable to expand logical volume %s: %v output:%s", volID, eerr, output)
+	}
+	if _, output, rerr := resizeEncryptedDevice(volID, params.passphrase); rerr != nil {
+		return nil, status.Errorf(codes.Internal, "unable to resize encrypted volume %s: %v output:%s", volID, rerr, output)
+	}
+	if !isBlock {
+		if output, rerr := resizeFilesystem(newCommandExecutor(), cryptMapperPath(volID), volPath); rerr != nil {
+			return nil, status.Errorf(codes.Internal, "unable to resize filesystem for %q: %v output: %s", volID, rerr, output)
+		}
 	}
 
 	return &csi.NodeExpandVolumeResponse{

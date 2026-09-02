@@ -70,12 +70,15 @@ func validateDeleteVolumeRequest(req *csi.DeleteVolumeRequest) error {
 	return nil
 }
 
-func buildVolumeContext(parameters map[string]string, requiredBytes int64) map[string]string {
-	volumeContext := make(map[string]string, len(parameters)+1)
+func buildVolumeContext(parameters map[string]string, requiredBytes int64, restored bool) map[string]string {
+	volumeContext := make(map[string]string, len(parameters)+2)
 	for key, value := range parameters {
 		volumeContext[key] = value
 	}
 	volumeContext["RequiredBytes"] = strconv.FormatInt(requiredBytes, 10)
+	// Written after the parameter copy so a StorageClass parameter of the same
+	// name cannot forge the flag the node plugin trusts.
+	volumeContext[restoredFromSourceKey] = strconv.FormatBool(restored)
 	return volumeContext
 }
 
@@ -247,6 +250,20 @@ func metadataFromPV(volume *v1.PersistentVolume) (string, string, string, error)
 		return "", "", "", err
 	}
 	return nodeName, vgName, lvmType, nil
+}
+
+// encryptedFromPV reports the encryption state recorded in a PersistentVolume's
+// CSI volume attributes. Those attributes are the volume context the controller
+// returned from CreateVolume, so an absent "encrypted" key unambiguously means
+// the volume is not encrypted.
+func encryptedFromPV(volume *v1.PersistentVolume) (bool, error) {
+	if volume == nil {
+		return false, fmt.Errorf("persistent volume is nil")
+	}
+	if volume.Spec.CSI == nil {
+		return false, fmt.Errorf("persistent volume %q has no CSI source", volume.Name)
+	}
+	return isEncrypted(volume.Spec.CSI.VolumeAttributes), nil
 }
 
 func lvmAttributesFromPV(name string, source *v1.CSIPersistentVolumeSource) (string, string, error) {
