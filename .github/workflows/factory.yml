@@ -13,31 +13,21 @@ on:
         default: ""
 
 env:
-  temp_registry: "ghcr.io"
-  repo: "rancher"
-  provisionerImageName: "harvester-lvm-provisioner"
-  pluginImageName: "harvester-lvm-csi-plugin"
-  webhookImageName: "harvester-lvm-csi-driver-webhook"
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  build:
+  build-binaries:
     strategy:
+      fail-fast: false
       matrix:
-        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-latest
-            platform: linux/amd64
           - arch: arm64
             runner: ubuntu-24.04-arm
-            platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      id-token: write
-      packages: write
-    env:
-      MK_PLATFORMS: ${{ matrix.platform }}
     steps:
     - name: Checkout code without refs
       if: ${{ inputs.refs == '' }}
@@ -49,100 +39,116 @@ jobs:
       with:
         ref: ${{ inputs.refs }}
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-    - name: Run dapper
+    - name: Run make ci
       run: make ci
 
-    - name: Login to GitHub Container Registry
-      if: ${{ inputs.push == true }}
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+    - name: Upload ${{ matrix.arch }} binaries
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        name: csi-driver-lvm-bin-${{ matrix.arch }}
+        path: bin/*-${{ matrix.arch }}
+        retention-days: 1
 
-    - name: Docker Build and Push (CSI Plugin - ${{ matrix.arch }})
-      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-      with:
-        provenance: false
-        context: .
-        platforms: ${{ matrix.platform }}
-        file: package/Dockerfile
-        push: ${{ inputs.push }}
-        tags: ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ env.pluginImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
-
-    - name: Docker Build and Push (LVM Provisioner - ${{ matrix.arch }})
-      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-      with:
-        provenance: false
-        context: .
-        platforms: ${{ matrix.platform }}
-        file: package/Dockerfile.provisioner
-        push: ${{ inputs.push }}
-        tags: ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ env.provisionerImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
-
-    - name: Docker Build and Push (LVM Webhook - ${{ matrix.arch }})
-      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-      with:
-        provenance: false
-        context: .
-        platforms: ${{ matrix.platform }}
-        file: package/Dockerfile.webhook
-        push: ${{ inputs.push }}
-        tags: ${{ env.temp_registry }}/${{ github.repository_owner  }}/${{ env.webhookImageName }}:temp-${{ github.run_id }}-${{ matrix.arch }}
-
-  manifest:
-    needs: build
+  publish:
+    needs: build-binaries
     if: ${{ inputs.push == true }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-      packages: write
     strategy:
+      fail-fast: false
       matrix:
-        component:
-          - name: plugin
-            image: harvester-lvm-csi-plugin
-          - name: provisioner
-            image: harvester-lvm-provisioner
-          - name: webhook
-            image: harvester-lvm-csi-driver-webhook
+        include:
+          - image: harvester-lvm-csi-plugin
+            dockerfile: package/Dockerfile
+          - image: harvester-lvm-provisioner
+            dockerfile: package/Dockerfile.provisioner
+          - image: harvester-lvm-csi-driver-webhook
+            dockerfile: package/Dockerfile.webhook
     steps:
-    - name: Read some Secrets
-      uses: rancher-eio/read-vault-secrets@d266f55186f80a893839f6e15662e67388e443e6 # v3
-      if: ${{ inputs.push == true }}
+    - name: checkout code without refs
+      if: ${{ inputs.refs == '' }}
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+    - name: Checkout code with refs
+      if: ${{ inputs.refs != '' }}
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       with:
-        secrets: |
-          secret/data/github/repo/${{ github.repository }}/dockerhub/harvester/credentials username  | DOCKER_USERNAME ;
-          secret/data/github/repo/${{ github.repository }}/dockerhub/harvester/credentials password  | DOCKER_PASSWORD ;
-    - name: Login to Docker Hub
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        ref: ${{ inputs.refs }}
+
+    - name: Download native-built binaries
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        username: ${{ env.DOCKER_USERNAME }}
-        password: ${{ env.DOCKER_PASSWORD }}
+        pattern: csi-driver-lvm-bin-*
+        path: bin
+        merge-multiple: true
 
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+    - name: Resolve registries
+      id: resolve
+      uses: harvester/harvester-actions/actions/resolve-registries@f5246cd8d423922ea55141991155f4b05f665bd5 # main
       with:
-        registry: ${{ env.temp_registry }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        release-tag-name: ${{ inputs.tag }}
+        is-release: ${{ github.event_name == 'release' && github.event.action == 'published' }}
 
-    - name: Create and push multi-arch manifest
-      run: |
-        docker buildx imagetools create \
-          -t ${{ env.repo }}/${{ matrix.component.image }}:${{ inputs.tag }} \
-          ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ matrix.component.image }}:temp-${{ github.run_id }}-amd64 \
-          ${{ env.temp_registry }}/${{ github.repository_owner }}/${{ matrix.component.image }}:temp-${{ github.run_id }}-arm64
-
-        echo "Multi-arch manifest created: ${{ env.repo }}/${{ matrix.component.image }}:${{ inputs.tag }} (Docker Hub)"
-
-    - name: Clean up temporary packages
-      run: |
-        gh api --method DELETE /user/packages/container/${{ matrix.component.image }}
-        echo "Deleted package ${{ matrix.component.image }}"
+    - name: Set image tag
+      run: echo "IMAGE_TAG=${RELEASE_TAG_NAME#prime-}" >> "$GITHUB_ENV"
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG_NAME: ${{ inputs.tag }}
+
+    - name: Login to Docker Hub
+      id: login-docker
+      if: ${{ steps.resolve.outputs.use-docker-io == 'true' }}
+      uses: harvester/harvester-actions/actions/login-docker-hub@f5246cd8d423922ea55141991155f4b05f665bd5 # main
+
+    - name: Publish public ${{ matrix.image }} image
+      if: ${{ steps.resolve.outputs.use-docker-io == 'true' }}
+      uses: harvester/harvester-actions/actions/publish-public-image@f5246cd8d423922ea55141991155f4b05f665bd5 # main
+      with:
+        context: .
+        dockerfile: ${{ matrix.dockerfile }}
+        image: ${{ matrix.image }}
+        tag: ${{ env.IMAGE_TAG }}
+        platforms: ${{ env.PLATFORMS }}
+        registry: ${{ steps.login-docker.outputs.registry }}
+        repository: ${{ steps.login-docker.outputs.repository }}
+
+    - name: Login to Staging Registry
+      id: login-staging
+      if: ${{ steps.resolve.outputs.use-staging == 'true' }}
+      uses: harvester/harvester-actions/actions/login-staging-registry@f5246cd8d423922ea55141991155f4b05f665bd5 # main
+
+    - name: Publish staging ${{ matrix.image }} image
+      if: ${{ steps.resolve.outputs.use-staging == 'true' }}
+      uses: harvester/harvester-actions/actions/publish-prime-image@f5246cd8d423922ea55141991155f4b05f665bd5 # main
+      with:
+        context: .
+        dockerfile: ${{ matrix.dockerfile }}
+        image: ${{ matrix.image }}
+        tag: ${{ env.IMAGE_TAG }}
+        platforms: ${{ env.PLATFORMS }}
+        registry: ${{ steps.login-staging.outputs.registry }}
+        repository: ${{ steps.login-staging.outputs.repository }}
+
+    - name: Login to Prime Registry
+      id: login-prime
+      if: ${{ steps.resolve.outputs.use-prime == 'true' }}
+      uses: harvester/harvester-actions/actions/login-prime-registry@f5246cd8d423922ea55141991155f4b05f665bd5 # main
+
+    - name: Publish prime ${{ matrix.image }} image
+      if: ${{ steps.resolve.outputs.use-prime == 'true' }}
+      uses: harvester/harvester-actions/actions/publish-prime-image@f5246cd8d423922ea55141991155f4b05f665bd5 # main
+      with:
+        context: .
+        dockerfile: ${{ matrix.dockerfile }}
+        image: ${{ matrix.image }}
+        tag: ${{ env.IMAGE_TAG }}
+        platforms: ${{ env.PLATFORMS }}
+        registry: ${{ steps.login-prime.outputs.registry }}
+        repository: ${{ steps.login-prime.outputs.repository }}
