@@ -55,32 +55,19 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	// Resolve the block device to publish. For encrypted volumes this is the
-	// opened dm-crypt mapper; otherwise it is the bare logical volume.
-	devicePath := fmt.Sprintf("/dev/%s/%s", vgName, req.GetVolumeId())
-	encrypted := isEncrypted(req.GetVolumeContext())
-	// Volumes restored from a snapshot or clone already hold their source's
-	// blocks, so the encryption state on disk is the source's, not this
-	// StorageClass's. Both mismatch directions are rejected at CreateVolume; the
-	// checks below are the last line of defence for a volume that reached the
-	// node anyway (a hand-written PV, or a PV created before this validation).
-	restored := isRestoredFromSource(req.GetVolumeContext())
-	if encrypted {
-		params, perr := extractCryptoParams(req.GetSecrets())
-		if perr != nil {
-			return nil, status.Error(codes.InvalidArgument, perr.Error())
-		}
-		// allowFormat is false for restores: no LUKS header there means the
-		// source was unencrypted, and formatting would destroy restored data.
-		mapperPath, oerr := openEncryptedDevice(devicePath, req.GetVolumeId(), params, !restored)
-		if oerr != nil {
-			return nil, encryptedOpenError(req.GetVolumeId(), oerr)
-		}
-		devicePath = mapperPath
-	} else if shouldProbeForLuks(restored, req.GetVolumeCapability()) {
-		if err := rejectLuksContainer(devicePath, req.GetVolumeId()); err != nil {
-			return nil, err
-		}
+	// Resolve the block device to publish. For an encrypted volume this is the
+	// dm-crypt mapper NodeStageVolume opened; otherwise it is the bare logical
+	// volume. The mapping is not torn down when the mount below fails - it
+	// belongs to the staging lifecycle and NodeUnstageVolume closes it.
+	devicePath, err := ns.resolveVolumeDevice(
+		req.GetVolumeId(),
+		vgName,
+		req.GetVolumeContext(),
+		req.GetSecrets(),
+		req.GetVolumeCapability(),
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	if req.GetVolumeCapability().GetBlock() != nil {
@@ -89,16 +76,65 @@ func (ns *nodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		err = ns.publishFilesystemVolume(req, devicePath)
 	}
 	if err != nil {
-		// Avoid leaking an open dm-crypt mapping if the mount step failed.
-		if encrypted {
-			if cerr := closeEncryptedDevice(req.GetVolumeId()); cerr != nil {
-				klog.Errorf("failed to close dm-crypt device for %s after publish error: %v", req.GetVolumeId(), cerr)
-			}
-		}
 		return nil, err
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// resolveVolumeDevice returns the block device a volume has to be mounted from
+// and, for an encrypted volume, makes sure its dm-crypt mapping is open.
+//
+// It is shared by NodeStageVolume and NodePublishVolume and is idempotent.
+// Staging is where the mapping is normally opened, using the node-stage secret;
+// publish then only has to resolve the already-open mapper, and needs no
+// credential of its own for it. Publish can still open the mapping when it
+// holds a credential and staging did not - a pre-provisioned PV whose
+// StorageClass wires only a node-publish secret, for instance.
+func (ns *nodeServer) resolveVolumeDevice(
+	volID, vgName string,
+	volumeContext, secrets map[string]string,
+	capability *csi.VolumeCapability,
+) (string, error) {
+	devicePath := fmt.Sprintf("/dev/%s/%s", vgName, volID)
+
+	encrypted, err := isEncrypted(volumeContext)
+	if err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "volume %s: %v", volID, err)
+	}
+	// Volumes restored from a snapshot or clone already hold their source's
+	// blocks, so the encryption state on disk is the source's, not this
+	// StorageClass's. Both mismatch directions are rejected at CreateVolume; the
+	// checks below are the last line of defence for a volume that reached the
+	// node anyway (a hand-written PV, or a PV created before this validation).
+	restored := isRestoredFromSource(volumeContext)
+
+	if !encrypted {
+		if shouldProbeForLuks(restored, capability) {
+			if err := rejectLuksContainer(devicePath, volID); err != nil {
+				return "", err
+			}
+		}
+		return devicePath, nil
+	}
+
+	// Reuse an open mapping without asking for the secret again, so a repeated
+	// stage or a publish that carries no secret of its own both succeed.
+	if mapperExists(volID) {
+		return cryptMapperPath(volID), nil
+	}
+
+	params, err := extractCryptoParams(secrets)
+	if err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "encrypted volume %s: %v", volID, err)
+	}
+	// allowFormat is false for restores: no LUKS header there usually means the
+	// source was unencrypted, and formatting would destroy restored data.
+	mapperPath, err := openEncryptedDevice(devicePath, volID, params, !restored)
+	if err != nil {
+		return "", encryptedOpenError(volID, err)
+	}
+	return mapperPath, nil
 }
 
 // encryptedOpenError maps a failure to open the dm-crypt mapping onto a CSI
@@ -200,40 +236,58 @@ func (ns *nodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 		return nil, status.Errorf(codes.Internal, "failed to remove target path %q: %v", targetPath, err)
 	}
 
-	// NodeUnpublishVolume carries no volume context or secrets, so we cannot
-	// tell here whether the volume was encrypted. closeEncryptedDevice is a
-	// no-op when no dm-crypt mapping exists, so it is safe to always attempt.
-	if err := closeEncryptedDevice(volID); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to close encrypted volume %s: %v", volID, err)
-	}
+	// The dm-crypt mapping is deliberately left open here. A ReadWriteOnce PVC
+	// can back several pods on the same node, so another target may still be
+	// mounted on the mapper; NodeUnstageVolume is the boundary CSI guarantees
+	// runs only once every target is gone, and that is where it is closed.
+	klog.Infof("unpublished volume %s from %s", volID, targetPath)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
 func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	// StripSecrets keeps the node-stage passphrase of an encrypted volume out of
+	// the logs.
+	klog.Infof("NodeStageVolume: %s", protosanitizer.StripSecrets(req))
+	vgName, err := validateNodeStageRequest(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
-	// Check arguments
-	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
-	}
-	if len(req.GetStagingTargetPath()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
-	}
-	if req.GetVolumeCapability() == nil {
-		return nil, status.Error(codes.InvalidArgument, "Volume Capability missing in request")
+	// Staging is where an encrypted volume's dm-crypt mapping is opened. CSI
+	// guarantees this runs once per node before any NodePublishVolume and before
+	// NodeExpandVolume, so every later call can rely on the mapper being there;
+	// opening it at publish instead would leave a legal stage -> expand ->
+	// publish sequence expanding a volume it believes to be plaintext.
+	//
+	// The staging path itself stays unused: this driver mounts straight to the
+	// target path in NodePublishVolume.
+	if _, err := ns.resolveVolumeDevice(
+		req.GetVolumeId(),
+		vgName,
+		req.GetVolumeContext(),
+		req.GetSecrets(),
+		req.GetVolumeCapability(),
+	); err != nil {
+		return nil, err
 	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 func (ns *nodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-
-	// Check arguments
-	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	klog.Infof("NodeUnstageVolume: %s", req)
+	volID, err := validateNodeUnstageRequest(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if len(req.GetStagingTargetPath()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
+
+	// CSI guarantees every NodeUnpublishVolume for this volume on this node has
+	// completed, so the mapper has no users left and luksClose cannot find it
+	// busy. Unstage carries no volume context, but closeEncryptedDevice is a
+	// no-op when there is no mapping, so a plain volume costs nothing here.
+	if err := closeEncryptedDevice(volID); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to close encrypted volume %s: %v", volID, err)
 	}
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -328,9 +382,18 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	// Expand requests carry no volume context, so probe for an open dm-crypt
-	// mapping to decide whether this is an encrypted volume.
-	encrypted, err := encryptedVolumeActive(volID)
+	// Expand requests carry no volume context, so the encryption state has to be
+	// read off the disk: does the backing LV carry a LUKS header? An open
+	// dm-crypt mapping is deliberately not the source of truth. CSI permits
+	// NodeExpandVolume between NodeStageVolume and NodePublishVolume, so keying
+	// off the mapper would misread a staged-but-unpublished encrypted volume as
+	// plaintext - resizing a filesystem that is not there, or sizing a block
+	// volume without the LUKS header overhead.
+	devicePath, err := backingDevicePath(volID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to locate volume %q: %v", volID, err)
+	}
+	encrypted, err := luksHeaderPresent(devicePath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to inspect encrypted volume %q: %v", volID, err)
 	}
@@ -341,6 +404,18 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 			return nil, status.Errorf(codes.Internal, "unable to expand volume %s: %v output:%s", volID, eerr, output)
 		}
 		return &csi.NodeExpandVolumeResponse{CapacityBytes: capacity}, nil
+	}
+
+	// NodeStageVolume opens the mapping, and CSI orders it before any expand, so
+	// its absence means the volume was never staged on this node. Say so rather
+	// than resizing the LUKS container's backing LV and leaving the mapping - and
+	// the filesystem inside it - at the old size.
+	if !mapperExists(volID) {
+		return nil, status.Errorf(
+			codes.FailedPrecondition,
+			"encrypted volume %s has no open dm-crypt mapping; it must be staged on this node before it can be expanded",
+			volID,
+		)
 	}
 
 	// Encrypted: the LUKS resize needs the passphrase, which reaches us only if

@@ -145,8 +145,43 @@ func validateNodePublishRequest(req *csi.NodePublishVolumeRequest) (string, erro
 	if err := validateNodePublishCapability(req.GetVolumeCapability(), req.GetReadonly()); err != nil {
 		return "", err
 	}
+	return vgNameFromVolumeContext(req.GetVolumeContext())
+}
 
-	vgName := req.GetVolumeContext()["vgName"]
+// validateNodeStageRequest checks a stage request and returns the volume group
+// the volume lives in. Staging needs the vgName because it resolves - and, for
+// an encrypted volume, opens - the backing block device.
+func validateNodeStageRequest(req *csi.NodeStageVolumeRequest) (string, error) {
+	if req.GetVolumeId() == "" {
+		return "", fmt.Errorf("volume ID missing in request")
+	}
+	if req.GetStagingTargetPath() == "" {
+		return "", fmt.Errorf("staging target path missing in request")
+	}
+	if !filepath.IsAbs(req.GetStagingTargetPath()) {
+		return "", fmt.Errorf("staging target path must be absolute")
+	}
+	if req.GetVolumeCapability() == nil {
+		return "", fmt.Errorf("volume capability missing in request")
+	}
+	if err := validateVolumeCapabilities([]*csi.VolumeCapability{req.GetVolumeCapability()}); err != nil {
+		return "", err
+	}
+	return vgNameFromVolumeContext(req.GetVolumeContext())
+}
+
+func validateNodeUnstageRequest(req *csi.NodeUnstageVolumeRequest) (string, error) {
+	if req.GetVolumeId() == "" {
+		return "", fmt.Errorf("volume ID missing in request")
+	}
+	if req.GetStagingTargetPath() == "" {
+		return "", fmt.Errorf("staging target path missing in request")
+	}
+	return req.GetVolumeId(), nil
+}
+
+func vgNameFromVolumeContext(volumeContext map[string]string) (string, error) {
+	vgName := volumeContext["vgName"]
 	if vgName == "" {
 		return "", fmt.Errorf("vgName is missing from volume context")
 	}
@@ -256,6 +291,11 @@ func metadataFromPV(volume *v1.PersistentVolume) (string, string, string, error)
 // CSI volume attributes. Those attributes are the volume context the controller
 // returned from CreateVolume, so an absent "encrypted" key unambiguously means
 // the volume is not encrypted.
+//
+// It reports whether the volume's StorageClass asked for encryption, which is
+// not the same as "a LUKS header exists on disk": the header is written on the
+// first NodeStageVolume, so a volume that was never attached has neither. The
+// node side reconciles the two, see restoredBlankDevice.
 func encryptedFromPV(volume *v1.PersistentVolume) (bool, error) {
 	if volume == nil {
 		return false, fmt.Errorf("persistent volume is nil")
@@ -263,7 +303,11 @@ func encryptedFromPV(volume *v1.PersistentVolume) (bool, error) {
 	if volume.Spec.CSI == nil {
 		return false, fmt.Errorf("persistent volume %q has no CSI source", volume.Name)
 	}
-	return isEncrypted(volume.Spec.CSI.VolumeAttributes), nil
+	encrypted, err := isEncrypted(volume.Spec.CSI.VolumeAttributes)
+	if err != nil {
+		return false, fmt.Errorf("persistent volume %q: %w", volume.Name, err)
+	}
+	return encrypted, nil
 }
 
 func lvmAttributesFromPV(name string, source *v1.CSIPersistentVolumeSource) (string, string, error) {

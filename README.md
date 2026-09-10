@@ -48,13 +48,15 @@ parameters:
   csi.storage.k8s.io/node-expand-secret-namespace: default
 ```
 
-`node-expand-secret-*` is required: expansion resizes the dm-crypt mapper before
-the filesystem, so `NodeExpandVolume` needs the passphrase too.
-`node-stage-secret-*` is required by Harvester's StorageClass webhook on an
-encrypted class, so set it to the same secret. The driver never reads it: it
-advertises `STAGE_UNSTAGE_VOLUME`, but `NodeStageVolume` only validates its
-request and returns — the dm-crypt mapping is opened at `NodePublishVolume`, so
-that is where the passphrase is consumed.
+`node-stage-secret-*` is where the passphrase is normally consumed: the dm-crypt
+mapping is opened by `NodeStageVolume` and closed by `NodeUnstageVolume`, the
+per-node boundary CSI runs exactly once around all of a volume's publishes.
+`node-publish-secret-*` is still honoured — publish opens the mapping itself if
+staging has not already done so — and Harvester's StorageClass webhook requires
+`node-stage-secret-*` on an encrypted class anyway, so set both to the same
+secret. `node-expand-secret-*` is required too: expansion resizes the dm-crypt
+mapper before the filesystem, so `NodeExpandVolume` needs the passphrase as
+well.
 
 On Harvester the secret reference must also be **static**. `${pvc.name}` /
 `${pvc.namespace}` templating works on upstream Kubernetes and gives every PVC
@@ -67,11 +69,13 @@ The secret must carry `CRYPTO_KEY_VALUE` (the passphrase); the optional
 fields tune `luksFormat` and default to `aes-xts-plain64` / `sha256` / `256` /
 `argon2i` (Longhorn's defaults) when omitted.
 
-On first `NodePublishVolume` the logical volume is LUKS2-formatted and opened as
+On first `NodeStageVolume` the logical volume is LUKS2-formatted and opened as
 `/dev/mapper/csi-lvm-<volID>`; the filesystem (or raw block bind-mount) is placed
 on the mapper so all data on the backing LV is encrypted. The passphrase is fed
 to `cryptsetup` over stdin and never appears in the host process list. The
-mapping is torn down on `NodeUnpublishVolume` and grown on `NodeExpandVolume`.
+mapping is grown by `NodeExpandVolume` and torn down by `NodeUnstageVolume` —
+not by `NodeUnpublishVolume`, because a ReadWriteOnce PVC can back several pods
+on one node and the mapper is shared by all of their mounts.
 
 See `examples/storageclass-dm-thin-encrypted.yaml`. **Losing the passphrase
 makes the data unrecoverable** — manage it with a KMS-backed secret store.
@@ -86,17 +90,20 @@ copy inherits the source's LUKS header — or its absence. Two consequences:
   source into a plain one, is rejected at `CreateVolume` with
   `InvalidArgument`. The first would LUKS-format restored data and destroy it;
   the second would expose the raw LUKS container as if it were a filesystem.
-  The node plugin enforces both rules again at publish time: it never
-  LUKS-formats a volume that was restored from a content source, and it refuses
-  to publish a filesystem volume whose blocks carry a LUKS header through a
-  plain StorageClass (for a raw block volume, where a workload may legitimately
-  keep its own LUKS header inside the volume, that probe is limited to
-  restores).
+  The node plugin enforces both rules again when it stages the volume: it never
+  LUKS-formats a volume that was restored from a content source and carries any
+  on-disk signature, and it refuses to stage a filesystem volume whose blocks
+  carry a LUKS header through a plain StorageClass (for a raw block volume,
+  where a workload may legitimately keep its own LUKS header inside the volume,
+  that probe is limited to restores). The one restored volume it does format is
+  one whose blocks are entirely blank — a snapshot or clone taken of an
+  encrypted PVC that had never been attached, so the source had no LUKS header
+  to copy and there is nothing on the copy to destroy.
 * **The restored volume needs the *source's* passphrase.** When the restored
   PVC resolves to a different secret than the source did — a per-PVC templated
   name, or simply a different StorageClass — that secret must hold the source's
   passphrase. A missing credential fails at `CreateVolume`; a wrong one fails at
-  `NodePublishVolume` with `FailedPrecondition`. Neither error echoes any secret
+  `NodeStageVolume` with `FailedPrecondition`. Neither error echoes any secret
   value.
 
 `CreateSnapshot` records the source's encryption state — non-secret metadata
@@ -106,7 +113,7 @@ gone. For a pre-provisioned `VolumeSnapshotContent` created by hand (no such
 record exists), declare the state with the
 `lvm.driver.harvesterhci.io/encrypted: "true"|"false"` annotation on the
 content. Without either, the source state is unknown: restoring into a plain
-StorageClass is allowed (the node still refuses to publish a stray LUKS
+StorageClass is allowed (the node still refuses to stage a stray LUKS
 container), and restoring into an encrypted one is rejected.
 
 Cloning an *unencrypted* source (a VM image, for example) into an encrypted

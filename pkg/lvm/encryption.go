@@ -70,7 +70,6 @@ const (
 	// cryptsetup exit codes we care about. See cryptsetup(8) EXIT STATUS.
 	cryptExitNotLuks      = 1 // isLuks: device does not carry a LUKS header
 	cryptExitNoPermission = 2 // luksOpen: no key available with this passphrase
-	cryptExitInactive     = 4 // status: no such active mapping
 )
 
 // Restore-safety errors. They are values rather than formatted strings so the
@@ -78,8 +77,9 @@ const (
 // StorageClass or the secret) instead of a generic, retried Internal error.
 var (
 	// errRestoredVolumeNotLuks fires when an encrypted StorageClass receives a
-	// volume restored from an unencrypted source. Formatting here would write a
-	// LUKS header over the restored filesystem, so the restore is refused.
+	// volume restored from a source that carries data but no LUKS header.
+	// Formatting here would write a LUKS header over the restored filesystem, so
+	// the restore is refused.
 	errRestoredVolumeNotLuks = errors.New(
 		"volume was restored from an unencrypted source but its StorageClass requests encryption; " +
 			"refusing to LUKS-format restored data")
@@ -129,14 +129,27 @@ func (e *execCryptExecutor) Execute(command string, args []string, stdin string)
 	return out, nil
 }
 
-// isEncrypted reports whether the volume context opts into encryption at rest.
-func isEncrypted(volumeContext map[string]string) bool {
+// isEncrypted reports whether the volume context (or the StorageClass
+// parameters it is built from) opts into encryption at rest.
+//
+// An unparseable value is an error rather than a silent "false": the parameter
+// controls a security property, so a typo such as encrypted: "ture" must fail
+// the request instead of quietly provisioning plaintext storage.
+func isEncrypted(volumeContext map[string]string) (bool, error) {
 	value, ok := volumeContext[encryptedParam]
 	if !ok {
-		return false
+		return false, nil
 	}
 	enabled, err := strconv.ParseBool(value)
-	return err == nil && enabled
+	if err != nil {
+		return false, fmt.Errorf(
+			"%q must be a boolean, got %q: refusing to fall back to unencrypted storage for an "+
+				"unrecognized value",
+			encryptedParam,
+			value,
+		)
+	}
+	return enabled, nil
 }
 
 // isRestoredFromSource reports whether the volume was populated from a snapshot
@@ -229,9 +242,10 @@ func valueOrDefault(value, fallback string) string {
 // so repeated NodePublishVolume calls are safe.
 //
 // allowFormat must be false for volumes restored from a snapshot or volume
-// content source. Those already hold data, so a missing LUKS header means the
-// source was unencrypted and formatting would destroy the restored content;
-// openEncryptedDevice fails with errRestoredVolumeNotLuks instead.
+// content source. A missing LUKS header on those is normally a sign that the
+// source was unencrypted, and formatting would destroy the restored content, so
+// openEncryptedDevice fails with errRestoredVolumeNotLuks - unless the restored
+// blocks turn out to be blank, which restoredBlankDevice explains.
 func openEncryptedDevice(devicePath, volID string, params *cryptoParams, allowFormat bool) (string, error) {
 	executor := newCryptExecutor()
 	mapperName := cryptMapperName(volID)
@@ -246,6 +260,15 @@ func openEncryptedDevice(devicePath, volID string, params *cryptoParams, allowFo
 	formatted, err := isLuks(executor, devicePath)
 	if err != nil {
 		return "", err
+	}
+	if !formatted && !allowFormat {
+		blank, berr := restoredBlankDevice(devicePath, volID)
+		if berr != nil {
+			return "", berr
+		}
+		// A blank restored device holds nothing to protect, so fall through and
+		// format it like a freshly created volume.
+		allowFormat = blank
 	}
 	if !formatted {
 		if !allowFormat {
@@ -267,6 +290,42 @@ func openEncryptedDevice(devicePath, volID string, params *cryptoParams, allowFo
 	}
 	klog.Infof("opened dm-crypt device %s for volume %s", mapperName, volID)
 	return mapperPath, nil
+}
+
+// restoredBlankDevice decides whether a restored volume that carries no LUKS
+// header may nevertheless be formatted.
+//
+// The encryption state recorded for a restore source is the state its
+// StorageClass asked for, not proof that a LUKS header was ever written: the
+// header is created on the first NodeStageVolume, so an encrypted PVC that was
+// snapshotted or cloned before it was ever attached has encrypted=true and no
+// header at all. Both ends of that restore agree they are encrypted, so the
+// controller admits it, and refusing to format here would leave the restored
+// volume permanently unusable.
+//
+// The discriminator is what the restored blocks actually contain. If wipefs
+// finds any signature the volume holds real plaintext data - the source was
+// unencrypted - and formatting must be refused. If it finds none, there is
+// nothing to destroy and the volume can be formatted like a new one.
+func restoredBlankDevice(devicePath, volID string) (bool, error) {
+	signatures, err := deviceSignatures(newCommandExecutor(), devicePath)
+	if err != nil {
+		return false, err
+	}
+	if len(signatures) > 0 {
+		return false, fmt.Errorf(
+			"%w (device %s carries a %s signature)",
+			errRestoredVolumeNotLuks,
+			devicePath,
+			strings.Join(signatures, ", "),
+		)
+	}
+	klog.Warningf(
+		"restored volume %s carries neither a LUKS header nor any other signature; treating it as a "+
+			"snapshot or clone of an encrypted volume that was never attached, and LUKS-formatting it now",
+		volID,
+	)
+	return true, nil
 }
 
 // luksHeaderPresent reports whether a block device already carries a LUKS
@@ -309,13 +368,16 @@ func resizeEncryptedDevice(volID, passphrase string) (bool, string, error) {
 	return true, out, nil
 }
 
-// encryptedVolumeActive reports whether an open dm-crypt mapping exists for the
-// volume. Used by paths (expand, unpublish) that receive no volume context.
-func encryptedVolumeActive(volID string) (bool, error) {
-	if !mapperExists(volID) {
-		return false, nil
+// backingDevicePath resolves the /dev/<vg>/<lv> path of a volume's backing
+// logical volume. Paths that receive no volume context - NodeExpandVolume - have
+// no vgName to build it from, but volume IDs are unique across the node's volume
+// groups, so the LV can be found by name.
+func backingDevicePath(volID string) (string, error) {
+	volume, err := getLogicalVolumeByName(volID)
+	if err != nil {
+		return "", err
 	}
-	return luksStatus(newCryptExecutor(), cryptMapperName(volID))
+	return fmt.Sprintf("/dev/%s/%s", volume.VGName, volume.Name), nil
 }
 
 func isLuks(executor cryptExecutor, devicePath string) (bool, error) {
@@ -327,17 +389,6 @@ func isLuks(executor cryptExecutor, devicePath string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("unable to probe LUKS header on %s: %w", devicePath, err)
-}
-
-func luksStatus(executor cryptExecutor, mapperName string) (bool, error) {
-	_, err := executor.Execute("cryptsetup", []string{"status", mapperName}, "")
-	if err == nil {
-		return true, nil
-	}
-	if code, ok := commandExitCode(err); ok && code == cryptExitInactive {
-		return false, nil
-	}
-	return false, fmt.Errorf("unable to query status of dm-crypt device %s: %w", mapperName, err)
 }
 
 func luksFormat(executor cryptExecutor, devicePath string, params *cryptoParams) (string, error) {

@@ -50,22 +50,40 @@ func useFakeCryptExecutor(t *testing.T, fake *fakeCryptExecutor) {
 	})
 }
 
+// "encrypted" controls a security property, so anything that is not a boolean
+// must fail the request rather than quietly resolve to plaintext storage.
 func TestIsEncrypted(t *testing.T) {
 	cases := []struct {
 		name    string
 		context map[string]string
 		want    bool
+		wantErr bool
 	}{
-		{"absent", map[string]string{}, false},
-		{"true", map[string]string{encryptedParam: "true"}, true},
-		{"one", map[string]string{encryptedParam: "1"}, true},
-		{"false", map[string]string{encryptedParam: "false"}, false},
-		{"garbage", map[string]string{encryptedParam: "yesplease"}, false},
+		{name: "absent", context: map[string]string{}},
+		{name: "true", context: map[string]string{encryptedParam: "true"}, want: true},
+		{name: "one", context: map[string]string{encryptedParam: "1"}, want: true},
+		{name: "false", context: map[string]string{encryptedParam: "false"}},
+		{name: "typo fails closed", context: map[string]string{encryptedParam: "ture"}, wantErr: true},
+		{name: "empty fails closed", context: map[string]string{encryptedParam: ""}, wantErr: true},
+		{name: "garbage fails closed", context: map[string]string{encryptedParam: "yesplease"}, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isEncrypted(tc.context); got != tc.want {
-				t.Fatalf("isEncrypted(%v)=%t, want %t", tc.context, got, tc.want)
+			got, err := isEncrypted(tc.context)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("isEncrypted(%v) = (%t, nil), want an error", tc.context, got)
+				}
+				if got {
+					t.Fatalf("isEncrypted(%v) reported true alongside an error", tc.context)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("isEncrypted(%v) returned %v", tc.context, err)
+			}
+			if got != tc.want {
+				t.Fatalf("isEncrypted(%v) = %t, want %t", tc.context, got, tc.want)
 			}
 		})
 	}
@@ -137,29 +155,6 @@ func TestIsLuks(t *testing.T) {
 		fake := &fakeCryptExecutor{t: t, results: []cryptResult{{err: commandExitError{code: 4}}}}
 		if _, err := isLuks(fake, "/dev/vg/lv"); err == nil {
 			t.Fatal("expected error for non-1 exit code")
-		}
-	})
-}
-
-func TestLuksStatus(t *testing.T) {
-	t.Run("active", func(t *testing.T) {
-		fake := &fakeCryptExecutor{t: t, results: []cryptResult{{}}}
-		ok, err := luksStatus(fake, "csi-lvm-x")
-		if err != nil || !ok {
-			t.Fatalf("expected (true,nil), got (%t,%v)", ok, err)
-		}
-	})
-	t.Run("inactive", func(t *testing.T) {
-		fake := &fakeCryptExecutor{t: t, results: []cryptResult{{err: commandExitError{code: cryptExitInactive}}}}
-		ok, err := luksStatus(fake, "csi-lvm-x")
-		if err != nil || ok {
-			t.Fatalf("expected (false,nil), got (%t,%v)", ok, err)
-		}
-	})
-	t.Run("other error", func(t *testing.T) {
-		fake := &fakeCryptExecutor{t: t, results: []cryptResult{{err: errors.New("boom")}}}
-		if _, err := luksStatus(fake, "csi-lvm-x"); err == nil {
-			t.Fatal("expected error")
 		}
 	})
 }
@@ -245,23 +240,83 @@ func TestOpenEncryptedDeviceSkipsFormatWhenLuks(t *testing.T) {
 }
 
 // A volume restored from an unencrypted source carries real data but no LUKS
-// header. Formatting it would destroy that data, so the open must fail instead.
+// header. Formatting it would destroy that data, so the open must fail instead -
+// and the error should name the signature that proves the blocks are in use.
 func TestOpenEncryptedDeviceRefusesToFormatRestoredVolume(t *testing.T) {
 	const volID = "unit-open-restored-plain"
-	fake := &fakeCryptExecutor{
+	crypt := &fakeCryptExecutor{
 		t:       t,
 		results: []cryptResult{{err: commandExitError{code: cryptExitNotLuks}}}, // isLuks -> not luks
 	}
-	useFakeCryptExecutor(t, fake)
+	useFakeCryptExecutor(t, crypt)
+	commands := &fakeCommandExecutor{
+		t:       t,
+		results: []commandResult{{command: "wipefs", output: `{"signatures":[{"type":"ext4"}]}`}},
+	}
+	useFakeCommandExecutor(t, commands)
 
 	_, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: "pw"}, false)
 	if !errors.Is(err, errRestoredVolumeNotLuks) {
 		t.Fatalf("expected errRestoredVolumeNotLuks, got %v", err)
 	}
-	if len(fake.calls) != 1 {
-		t.Fatalf("expected only the isLuks probe, got %#v", fake.calls)
+	if !strings.Contains(err.Error(), "ext4") {
+		t.Fatalf("error should name the signature it found, got %v", err)
 	}
-	assertCryptSubcommand(t, fake.calls[0], "isLuks", "")
+	if len(crypt.calls) != 1 {
+		t.Fatalf("expected only the isLuks probe, got %#v", crypt.calls)
+	}
+	assertCryptSubcommand(t, crypt.calls[0], "isLuks", "")
+}
+
+// An encrypted PVC only gets its LUKS header on the first NodeStageVolume, so a
+// snapshot or clone taken before it was ever attached restores onto blank
+// blocks. Both ends agree the volume is encrypted, so refusing to format here
+// would leave the restore permanently unusable - and there is no data to lose.
+func TestOpenEncryptedDeviceFormatsBlankRestoredVolume(t *testing.T) {
+	const volID = "unit-open-restored-blank"
+	crypt := &fakeCryptExecutor{
+		t: t,
+		results: []cryptResult{
+			{err: commandExitError{code: cryptExitNotLuks}}, // isLuks -> not luks
+			{}, // luksFormat
+			{}, // luksOpen
+		},
+	}
+	useFakeCryptExecutor(t, crypt)
+	// wipefs prints nothing at all for a device with no signature.
+	commands := &fakeCommandExecutor{t: t, results: []commandResult{{command: "wipefs"}}}
+	useFakeCommandExecutor(t, commands)
+
+	mapperPath, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: "pw"}, false)
+	if err != nil {
+		t.Fatalf("a blank restored device must be formatted, got %v", err)
+	}
+	if want := cryptMapperPath(volID); mapperPath != want {
+		t.Fatalf("mapperPath = %q, want %q", mapperPath, want)
+	}
+	if len(crypt.calls) != 3 {
+		t.Fatalf("expected isLuks, luksFormat, luksOpen; got %#v", crypt.calls)
+	}
+	assertCryptSubcommand(t, crypt.calls[1], "luksFormat", "pw")
+	assertCryptSubcommand(t, crypt.calls[2], "luksOpen", "pw")
+}
+
+// A probe that cannot answer must not be read as "blank": failing to reach
+// wipefs has to stop the format, not license it.
+func TestOpenEncryptedDeviceRefusesFormatWhenSignatureProbeFails(t *testing.T) {
+	const volID = "unit-open-restored-probe-error"
+	useFakeCryptExecutor(t, &fakeCryptExecutor{
+		t:       t,
+		results: []cryptResult{{err: commandExitError{code: cryptExitNotLuks}}},
+	})
+	useFakeCommandExecutor(t, &fakeCommandExecutor{
+		t:       t,
+		results: []commandResult{{command: "wipefs", err: errors.New("transient probe failure")}},
+	})
+
+	if _, err := openEncryptedDevice("/dev/vg/"+volID, volID, &cryptoParams{passphrase: "pw"}, false); err == nil {
+		t.Fatal("expected the failed signature probe to stop the format")
+	}
 }
 
 // Restoring an encrypted snapshot with a secret holding a different passphrase
@@ -363,9 +418,8 @@ func TestCloseAndResizeNoopWithoutMapper(t *testing.T) {
 	if err != nil || active {
 		t.Fatalf("resizeEncryptedDevice should be a no-op, got (active=%t, err=%v)", active, err)
 	}
-	got, err := encryptedVolumeActive(volID)
-	if err != nil || got {
-		t.Fatalf("encryptedVolumeActive should be false, got (%t, %v)", got, err)
+	if mapperExists(volID) {
+		t.Fatalf("no dm-crypt mapper should exist for %s", volID)
 	}
 	if len(fake.calls) != 0 {
 		t.Fatalf("expected no cryptsetup calls, got %#v", fake.calls)

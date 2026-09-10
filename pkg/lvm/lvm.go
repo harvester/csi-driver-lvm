@@ -223,7 +223,7 @@ func (lvm *Lvm) Run() error {
 // mountLV formats (when required) and mounts the device at lvPath onto
 // mountPath. lvPath is the resolved block device to mount: for plain volumes
 // this is /dev/<vg>/<lv>, and for encrypted volumes it is the opened dm-crypt
-// mapper (/dev/mapper/csi-lvm-<volID>) produced by NodePublishVolume.
+// mapper (/dev/mapper/csi-lvm-<volID>) produced by NodeStageVolume.
 func mountLV(lvPath, mountPath, fsType string, mountOptions []string, readOnly bool) (string, error) {
 	executor := newCommandExecutor()
 	fsType = defaultFilesystemType(fsType)
@@ -394,6 +394,38 @@ func getFilesystemTypeFromWipefs(executor commandExecutor, lvPath string) (strin
 		return "", fmt.Errorf("wipefs reported a signature without a type for %q", lvPath)
 	}
 	return fsType, nil
+}
+
+// deviceSignatures lists every signature wipefs recognizes on a device -
+// filesystems, RAID members, partition tables and LUKS headers alike. An empty
+// result means the device holds nothing recognizable, i.e. there is no content
+// that overwriting it could destroy.
+func deviceSignatures(executor commandExecutor, devicePath string) ([]string, error) {
+	out, err := executor.Execute("wipefs", []string{"--no-act", "--json", "--output", "TYPE", devicePath})
+	if err != nil {
+		return nil, fmt.Errorf("unable to probe %q for existing signatures with wipefs: %w", devicePath, err)
+	}
+	// wipefs prints nothing at all - not even an empty JSON object - for a
+	// device that carries no signature.
+	if strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
+
+	report := wipefsReport{}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		return nil, fmt.Errorf("unable to parse wipefs output for %q: %w", devicePath, err)
+	}
+	if report.Signatures == nil {
+		return nil, nil
+	}
+
+	types := make([]string, 0, len(*report.Signatures))
+	for _, signature := range *report.Signatures {
+		if signatureType := strings.TrimSpace(signature.Type); signatureType != "" {
+			types = append(types, signatureType)
+		}
+	}
+	return types, nil
 }
 
 func normalizeMountOptions(values []string, readOnly bool) []string {

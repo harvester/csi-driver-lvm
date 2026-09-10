@@ -166,7 +166,10 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	klog.Infof("creating volume %s on node: %s", req.GetName(), node)
 
-	dstEncrypted := isEncrypted(req.GetParameters())
+	dstEncrypted, err := isEncrypted(req.GetParameters())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "storage class parameter: %v", err)
+	}
 
 	// Restores are block-level clones of the source LV, so the destination
 	// inherits the source's on-disk encryption state. Reject the combinations
@@ -833,6 +836,11 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	// location so a restore can refuse mismatched destinations even when the
 	// source volume is long gone. This is non-secret metadata: it says whether
 	// the blocks are encrypted, never anything about the key.
+	//
+	// What is recorded is the state the source's StorageClass asked for. A
+	// source that was never attached carries no LUKS header yet, so a restore of
+	// this snapshot lands on blocks that are blank rather than encrypted; the
+	// node reconciles that case when it opens the volume (restoredBlankDevice).
 	encrypted, err := encryptedFromPV(volume)
 	if err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
