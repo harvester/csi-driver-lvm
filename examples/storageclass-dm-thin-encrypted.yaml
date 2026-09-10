@@ -1,7 +1,7 @@
 # Encrypted-at-rest dm-thin StorageClass (LUKS2 / dm-crypt).
 #
 # Each volume provisioned from this class is LUKS2-formatted and opened as a
-# dm-crypt device on the node at NodePublishVolume, so all data written to the
+# dm-crypt device on the node at NodeStageVolume, so all data written to the
 # backing logical volume is encrypted at rest. The passphrase and LUKS tuning
 # are supplied via a CSI secret that follows the same CRYPTO_KEY_* convention as
 # Longhorn encrypted volumes, so the Harvester webhook and UI accept it
@@ -14,13 +14,14 @@
 #   / argon2i). Harvester's own StorageClass webhook is stricter and wants all
 #   of them present and non-empty, as below.
 # - Losing the passphrase means the data is unrecoverable.
-# - All four secret references are set. node-stage-secret-* is required by
-#   Harvester's webhook on any encrypted StorageClass, but this driver never
-#   reads it: it advertises STAGE_UNSTAGE_VOLUME while its NodeStageVolume only
-#   validates the request, and the dm-crypt mapping is opened at
-#   NodePublishVolume. node-expand-secret-* IS used:
-#   growing the filesystem means resizing the dm-crypt mapper first, and without
-#   it expansion fails with "expand is missing its passphrase secret".
+# - All four secret references are set, and all four are used. The dm-crypt
+#   mapping is opened at NodeStageVolume and closed at NodeUnstageVolume, so
+#   node-stage-secret-* - which Harvester's webhook requires on any encrypted
+#   StorageClass anyway - is where the passphrase is normally read;
+#   node-publish-secret-* covers a publish that reaches an unmapped volume.
+#   node-expand-secret-* is needed because growing the filesystem means resizing
+#   the dm-crypt mapper first; without it expansion fails with "expand is
+#   missing its passphrase secret".
 # - The secret reference here is static. ${pvc.name}/${pvc.namespace} templating
 #   works on upstream Kubernetes and gives every PVC its own key, but Harvester's
 #   webhook resolves the reference literally at StorageClass-admission time and
@@ -29,7 +30,7 @@
 # - RESTORES (from a snapshot or a clone source) are block-level copies, so the
 #   destination inherits the source's LUKS header and can only be opened with
 #   the SOURCE's passphrase. Restoring through a StorageClass that references a
-#   different key fails at NodePublishVolume with FailedPrecondition. Restoring
+#   different key fails at NodeStageVolume with FailedPrecondition. Restoring
 #   across an encryption-state mismatch (unencrypted source into this class, or
 #   an encrypted source into a plain class) is rejected at CreateVolume.
 allowVolumeExpansion: true
