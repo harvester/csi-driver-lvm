@@ -73,7 +73,7 @@ func TestMountLVDoesNotFormatWhenFilesystemProbeFails(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	_, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false)
+	_, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false)
 	if err == nil || !strings.Contains(err.Error(), "unable to determine filesystem type") {
 		t.Fatalf("expected filesystem probe error, got %v", err)
 	}
@@ -92,7 +92,7 @@ func TestMountLVDoesNotFormatWhenBlkidIsAmbiguous(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	_, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false)
+	_, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false)
 	if err == nil || !strings.Contains(err.Error(), "ambiguous filesystem signatures") {
 		t.Fatalf("expected ambiguous signature error, got %v", err)
 	}
@@ -111,7 +111,7 @@ func TestMountLVDoesNotFormatWhenBlkidHasOperationalError(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	_, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false)
+	_, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false)
 	if err == nil || !strings.Contains(err.Error(), "blkid failed to inspect") {
 		t.Fatalf("expected blkid operational error, got %v", err)
 	}
@@ -131,7 +131,7 @@ func TestMountLVUsesWipefsToConfirmExistingFilesystem(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	if _, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false); err != nil {
+	if _, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false); err != nil {
 		t.Fatalf("mountLV failed: %v", err)
 	}
 	if want := []string{"-p", "-s", "TYPE", "-o", "value", "/dev/vg/volume"}; !reflect.DeepEqual(fake.calls[0].args, want) {
@@ -155,7 +155,7 @@ func TestMountLVDoesNotFormatWhenWipefsFails(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	_, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false)
+	_, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false)
 	if err == nil || !strings.Contains(err.Error(), "unable to confirm filesystem signatures") {
 		t.Fatalf("expected wipefs error, got %v", err)
 	}
@@ -174,7 +174,7 @@ func TestMountLVDoesNotFormatXFSExternalLogSignature(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	_, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "xfs", nil, false)
+	_, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "xfs", nil, false)
 	if err == nil || !strings.Contains(err.Error(), `"xfs_external_log" found`) {
 		t.Fatalf("expected existing signature error, got %v", err)
 	}
@@ -195,7 +195,7 @@ func TestMountLVFormatsOnlyAfterWipefsConfirmsNoSignatures(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	if _, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false); err != nil {
+	if _, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false); err != nil {
 		t.Fatalf("mountLV failed: %v", err)
 	}
 	commands := make([]string, 0, len(fake.calls))
@@ -218,7 +218,7 @@ func TestMountLVPassesMountFlagsAndReadOnly(t *testing.T) {
 	useFakeCommandExecutor(t, fake)
 
 	mountPath := filepath.Join(t.TempDir(), "mount")
-	if _, err := mountLV("volume", mountPath, "vg", "ext4", []string{"noatime"}, true); err != nil {
+	if _, err := mountLV("/dev/vg/volume", mountPath, "ext4", []string{"noatime"}, true); err != nil {
 		t.Fatalf("mountLV failed: %v", err)
 	}
 
@@ -247,7 +247,7 @@ func TestMountLVAcceptsAlreadyMountedError(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	if _, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, false); err != nil {
+	if _, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, false); err != nil {
 		t.Fatalf("idempotent mount retry failed: %v", err)
 	}
 }
@@ -263,7 +263,7 @@ func TestMountLVRejectsWritableExistingMountForReadOnlyRequest(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	_, err := mountLV("volume", filepath.Join(t.TempDir(), "mount"), "vg", "ext4", nil, true)
+	_, err := mountLV("/dev/vg/volume", filepath.Join(t.TempDir(), "mount"), "ext4", nil, true)
 	if err == nil || !strings.Contains(err.Error(), "readonly was requested") {
 		t.Fatalf("expected incompatible existing mount error, got %v", err)
 	}

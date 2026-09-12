@@ -254,14 +254,35 @@ func TestBuildVolumeContext(t *testing.T) {
 		"vgName": "vg-a",
 	}
 
-	got := buildVolumeContext(parameters, 1048576)
+	got := buildVolumeContext(parameters, 1048576, false)
 	if got["type"] != DmThinType ||
 		got["vgName"] != "vg-a" ||
 		got["RequiredBytes"] != "1048576" {
 		t.Fatalf("unexpected volume context: %#v", got)
 	}
+	if isRestoredFromSource(got) {
+		t.Fatalf("a volume created empty must not be flagged as restored: %#v", got)
+	}
 	if _, exists := parameters["RequiredBytes"]; exists {
 		t.Fatal("buildVolumeContext must not mutate request parameters")
+	}
+
+	restored := buildVolumeContext(parameters, 1048576, true)
+	if !isRestoredFromSource(restored) {
+		t.Fatalf("a volume created from a content source must be flagged as restored: %#v", restored)
+	}
+}
+
+// A StorageClass parameter must not be able to forge the restore flag the node
+// plugin trusts to decide whether LUKS-formatting is safe.
+func TestBuildVolumeContextIgnoresForgedRestoreParameter(t *testing.T) {
+	got := buildVolumeContext(map[string]string{
+		"type":                DmThinType,
+		"vgName":              "vg-a",
+		restoredFromSourceKey: "false",
+	}, 1048576, true)
+	if !isRestoredFromSource(got) {
+		t.Fatalf("StorageClass parameter overrode the driver's restore flag: %#v", got)
 	}
 }
 
