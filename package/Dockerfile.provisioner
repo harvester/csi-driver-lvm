@@ -14,6 +14,6 @@ RUN if [ "$TARGETPLATFORM" != "linux/amd64" ] && [ "$TARGETPLATFORM" != "linux/a
     fi
 
 ENV ARCH=${TARGETPLATFORM#linux/}
-COPY bin/csi-lvmplugin-provisioner-${ARCH} /usr/bin/csi-lvmplugin-provisioner
+COPY --chmod=755 bin/csi-lvmplugin-provisioner-${ARCH} /usr/bin/csi-lvmplugin-provisioner
 USER root
 ENTRYPOINT ["csi-lvmplugin-provisioner"]
