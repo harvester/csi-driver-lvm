@@ -220,9 +220,12 @@ func (lvm *Lvm) Run() error {
 	return nil
 }
 
-func mountLV(lvname, mountPath, vgName, fsType string, mountOptions []string, readOnly bool) (string, error) {
+// mountLV formats (when required) and mounts the device at lvPath onto
+// mountPath. lvPath is the resolved block device to mount: for plain volumes
+// this is /dev/<vg>/<lv>, and for encrypted volumes it is the opened dm-crypt
+// mapper (/dev/mapper/csi-lvm-<volID>) produced by NodeStageVolume.
+func mountLV(lvPath, mountPath, fsType string, mountOptions []string, readOnly bool) (string, error) {
 	executor := newCommandExecutor()
-	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvname)
 	fsType = defaultFilesystemType(fsType)
 
 	formatOutput, err := ensureFilesystem(executor, lvPath, fsType)
@@ -393,6 +396,38 @@ func getFilesystemTypeFromWipefs(executor commandExecutor, lvPath string) (strin
 	return fsType, nil
 }
 
+// deviceSignatures lists every signature wipefs recognizes on a device -
+// filesystems, RAID members, partition tables and LUKS headers alike. An empty
+// result means the device holds nothing recognizable, i.e. there is no content
+// that overwriting it could destroy.
+func deviceSignatures(executor commandExecutor, devicePath string) ([]string, error) {
+	out, err := executor.Execute("wipefs", []string{"--no-act", "--json", "--output", "TYPE", devicePath})
+	if err != nil {
+		return nil, fmt.Errorf("unable to probe %q for existing signatures with wipefs: %w", devicePath, err)
+	}
+	// wipefs prints nothing at all - not even an empty JSON object - for a
+	// device that carries no signature.
+	if strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
+
+	report := wipefsReport{}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		return nil, fmt.Errorf("unable to parse wipefs output for %q: %w", devicePath, err)
+	}
+	if report.Signatures == nil {
+		return nil, nil
+	}
+
+	types := make([]string, 0, len(*report.Signatures))
+	for _, signature := range *report.Signatures {
+		if signatureType := strings.TrimSpace(signature.Type); signatureType != "" {
+			types = append(types, signatureType)
+		}
+	}
+	return types, nil
+}
+
 func normalizeMountOptions(values []string, readOnly bool) []string {
 	options := make([]string, 0, len(values)+1)
 	hasReadOnly := false
@@ -412,10 +447,12 @@ func normalizeMountOptions(values []string, readOnly bool) []string {
 	return append(options, "ro")
 }
 
-func bindMountLV(lvname, mountPath, vgName string, readOnly bool) (string, error) {
+// bindMountLV bind-mounts the raw block device at lvPath onto mountPath. lvPath
+// is the resolved device: /dev/<vg>/<lv> for plain volumes, or the opened
+// dm-crypt mapper (/dev/mapper/csi-lvm-<volID>) for encrypted volumes.
+func bindMountLV(lvPath, mountPath string, readOnly bool) (string, error) {
 	executor := newCommandExecutor()
-	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvname)
-	if err := prepareBindMountTarget(lvname, mountPath); err != nil {
+	if err := prepareBindMountTarget(lvPath, mountPath); err != nil {
 		return "", err
 	}
 
@@ -1076,7 +1113,8 @@ func extendLVS(name string, size uint64, isBlock bool, volumePath string) (strin
 		return lvOutput, nil
 	}
 
-	fsOutput, err := resizeFilesystem(executor, volume, volumePath)
+	devicePath := fmt.Sprintf("/dev/%s/%s", volume.VGName, volume.Name)
+	fsOutput, err := resizeFilesystem(executor, devicePath, volumePath)
 	return combineCommandOutput(lvOutput, fsOutput), err
 }
 
@@ -1099,8 +1137,7 @@ func ensureLogicalVolumeSize(executor commandExecutor, volume logicalVolume, siz
 	return output, nil
 }
 
-func resizeFilesystem(executor commandExecutor, volume logicalVolume, volumePath string) (string, error) {
-	devicePath := fmt.Sprintf("/dev/%s/%s", volume.VGName, volume.Name)
+func resizeFilesystem(executor commandExecutor, devicePath, volumePath string) (string, error) {
 	fsType, err := getFilesystemType(executor, devicePath)
 	if err != nil {
 		return "", fmt.Errorf("unable to detect filesystem on %q: %w", devicePath, err)
