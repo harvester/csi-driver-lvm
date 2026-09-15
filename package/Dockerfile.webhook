@@ -15,5 +15,5 @@ RUN if [ "$TARGETPLATFORM" != "linux/amd64" ] && [ "$TARGETPLATFORM" != "linux/a
 
 ENV ARCH=${TARGETPLATFORM#linux/}
 
-COPY bin/csi-driver-lvm-webhook-${ARCH} /usr/bin/csi-driver-lvm-webhook
+COPY --chmod=755 bin/csi-driver-lvm-webhook-${ARCH} /usr/bin/csi-driver-lvm-webhook
 ENTRYPOINT ["csi-driver-lvm-webhook"]

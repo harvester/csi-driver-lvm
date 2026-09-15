@@ -15,5 +15,5 @@ RUN if [ "$TARGETPLATFORM" != "linux/amd64" ] && [ "$TARGETPLATFORM" != "linux/a
 
 ENV ARCH=${TARGETPLATFORM#linux/}
 
-COPY bin/lvmplugin-${ARCH} /usr/bin/lvmplugin
+COPY --chmod=755 bin/lvmplugin-${ARCH} /usr/bin/lvmplugin
 ENTRYPOINT ["lvmplugin"]
