@@ -118,10 +118,11 @@ const (
 
 	// Keep these exit statuses synchronized with util-linux misc-utils/blkid.c.
 	// https://github.com/util-linux/util-linux/blob/master/misc-utils/blkid.c
-	blkidExitNotFound  = 2
-	blkidExitOther     = 4
-	blkidExitAmbiguous = 8
-	unmountTimeout     = 30 * time.Second
+	blkidExitNotFound     = 2
+	blkidExitOther        = 4
+	blkidExitAmbiguous    = 8
+	unmountTimeout        = 30 * time.Second
+	thinPoolCreateTimeout = 15 * time.Minute
 )
 
 type commandExecutor interface {
@@ -920,20 +921,123 @@ func prepareThinPool(vgName, lvmType string) (string, error) {
 	}
 
 	thinPoolName := fmt.Sprintf("%s-thinpool", vgName)
-	found, err := getThinPool(vgName, thinPoolName)
+	pool, found, err := getLogicalVolume(vgName, thinPoolName)
 	if err != nil {
-		return "", fmt.Errorf("unable to determine if thin pool %q/%q exists: %w", vgName, thinPoolName, err)
+		return "", fmt.Errorf(
+			"unable to determine if thin pool %q/%q exists: %w",
+			vgName,
+			thinPoolName,
+			err,
+		)
 	}
 	if found {
-		return thinPoolName, validateThinPool(vgName, thinPoolName)
+		return thinPoolName, checkThinPool(pool)
 	}
 
+	return thinPoolName, createThinPool(vgName, thinPoolName)
+}
+
+func checkThinPool(pool logicalVolume) error {
+	if pool.SegType != ThinPoolType {
+		return fmt.Errorf(
+			"thin pool %q/%q is incomplete: expected segment type %q, found %q",
+			pool.VGName,
+			pool.Name,
+			ThinPoolType,
+			pool.SegType,
+		)
+	}
+	return validateThinPool(pool.VGName, pool.Name)
+}
+
+func createThinPool(vgName, thinPoolName string) error {
 	args := thinPoolCreateArgs(vgName, thinPoolName)
 	klog.Infof("lvcreate %s", args)
-	if _, err := newCommandExecutor().Execute("lvcreate", args); err != nil {
-		return "", fmt.Errorf("unable to create thin pool %q/%q: %w", vgName, thinPoolName, err)
+	executor := newCommandExecutor()
+	timedExecutor, ok := executor.(timedCommandExecutor)
+	if !ok {
+		return fmt.Errorf("lvcreate executor does not support command timeouts")
 	}
-	return thinPoolName, nil
+	timedExecutor.SetTimeout(thinPoolCreateTimeout)
+	_, err := timedExecutor.Execute("lvcreate", args)
+	if err == nil {
+		return nil
+	}
+	return handleThinPoolCreateError(vgName, thinPoolName, err)
+}
+
+func handleThinPoolCreateError(vgName, thinPoolName string, createErr error) error {
+	if !errors.Is(createErr, cmd.ErrCmdTimeout) {
+		return thinPoolCreateError(vgName, thinPoolName, createErr)
+	}
+
+	rollbackErr := rollbackThinPoolCreate(vgName, thinPoolName)
+	if rollbackErr == nil {
+		return thinPoolCreateError(vgName, thinPoolName, createErr)
+	}
+	return fmt.Errorf(
+		"unable to create thin pool %q/%q: %w; rollback failed: %v",
+		vgName,
+		thinPoolName,
+		createErr,
+		rollbackErr,
+	)
+}
+
+func thinPoolCreateError(vgName, thinPoolName string, err error) error {
+	return fmt.Errorf(
+		"unable to create thin pool %q/%q: %w",
+		vgName,
+		thinPoolName,
+		err,
+	)
+}
+
+func rollbackThinPoolCreate(vgName, thinPoolName string) error {
+	pool, found, err := getLogicalVolume(vgName, thinPoolName)
+	if err != nil {
+		return fmt.Errorf("unable to inspect timed-out thin-pool creation: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	if pool.SegType == ThinPoolType {
+		klog.Infof(
+			"thin pool %s/%s exists after lvcreate timeout; preserving it for retry validation",
+			vgName,
+			thinPoolName,
+		)
+		return nil
+	}
+	if pool.SegType != LinearType {
+		return fmt.Errorf(
+			"refusing to remove logical volume %q/%q with unexpected segment type %q",
+			vgName,
+			thinPoolName,
+			pool.SegType,
+		)
+	}
+
+	args := []string{
+		"-q",
+		"-y",
+		fmt.Sprintf("%s/%s", vgName, thinPoolName),
+	}
+	klog.Warningf(
+		"removing incomplete thin pool after lvcreate timeout: lvremove %s",
+		args,
+	)
+	out, err := newCommandExecutor().Execute("lvremove", args)
+	if err != nil {
+		return fmt.Errorf(
+			"unable to remove incomplete logical volume %q/%q: %w output:%s",
+			vgName,
+			thinPoolName,
+			err,
+			out,
+		)
+	}
+	return nil
 }
 
 func thinPoolCreateArgs(vg, thinPoolName string) []string {
@@ -1327,17 +1431,6 @@ func getThinPoolAndCounts(vgName string) (map[string]int, error) {
 		}
 	}
 	return thinInfo, nil
-}
-
-func getThinPool(vgName, thinpoolName string) (bool, error) {
-	thinPoolInfo, err := getThinPoolAndCounts(vgName)
-	if err != nil {
-		return false, err
-	}
-	if _, ok := thinPoolInfo[thinpoolName]; ok {
-		return true, nil
-	}
-	return false, nil
 }
 
 func validateThinPool(vgName, thinpoolName string) error {

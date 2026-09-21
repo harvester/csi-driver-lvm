@@ -7,6 +7,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	cmd "github.com/harvester/go-common/command"
 )
 
 type commandCall struct {
@@ -33,9 +36,14 @@ func (e commandExitError) ExitCode() int {
 }
 
 type fakeCommandExecutor struct {
-	t       *testing.T
-	results []commandResult
-	calls   []commandCall
+	t        *testing.T
+	results  []commandResult
+	calls    []commandCall
+	timeouts []time.Duration
+}
+
+func (f *fakeCommandExecutor) SetTimeout(timeout time.Duration) {
+	f.timeouts = append(f.timeouts, timeout)
 }
 
 func (f *fakeCommandExecutor) Execute(command string, args []string) (string, error) {
@@ -312,7 +320,17 @@ func TestCreateLVSExistingVolumeCompatibility(t *testing.T) {
 
 func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 	const noVolumes = `{"report":[{"lv":[]}]}`
-	const thinPool = "vg thin-pool vg-thinpool 0\n"
+	const thinPool = `{
+		"report": [{
+			"lv": [{
+				"lv_name": "vg-thinpool",
+				"vg_name": "vg",
+				"lv_size": "1048576",
+				"segtype": "thin-pool",
+				"origin": ""
+			}]
+		}]
+	}`
 
 	t.Run("inactive pool fails before lvcreate", func(t *testing.T) {
 		fake := &fakeCommandExecutor{
@@ -378,7 +396,7 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 			t: t,
 			results: []commandResult{
 				{command: "lvs", output: noVolumes},
-				{command: "lvs"},
+				{command: "lvs", output: noVolumes},
 				{command: "lvcreate", output: "pool created"},
 				{command: "vgs", output: "1"},
 				{command: "lvcreate", output: "volume created"},
@@ -401,6 +419,75 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		}
 		if !reflect.DeepEqual(fake.calls[2].args, wantPoolArgs) {
 			t.Fatalf("unexpected thin-pool creation arguments: want %#v, got %#v", wantPoolArgs, fake.calls[2].args)
+		}
+		if want := []time.Duration{15 * time.Minute}; !reflect.DeepEqual(fake.timeouts, want) {
+			t.Fatalf("unexpected thin-pool creation timeout: want %v, got %v", want, fake.timeouts)
+		}
+	})
+
+	t.Run("linear pool is reported as incomplete", func(t *testing.T) {
+		const incompletePool = `{
+			"report": [{
+				"lv": [{
+					"lv_name": "vg-thinpool",
+					"vg_name": "vg",
+					"lv_size": "1048576",
+					"segtype": "linear",
+					"origin": ""
+				}]
+			}]
+		}`
+		fake := &fakeCommandExecutor{
+			t: t,
+			results: []commandResult{
+				{command: "lvs", output: noVolumes},
+				{command: "lvs", output: incompletePool},
+			},
+		}
+		useFakeCommandExecutor(t, fake)
+
+		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		if err == nil || !strings.Contains(err.Error(), `thin pool "vg"/"vg-thinpool" is incomplete`) {
+			t.Fatalf("expected incomplete thin-pool error, got %v", err)
+		}
+		if len(fake.calls) != 2 {
+			t.Fatalf("incomplete pool should fail before lvcreate, got %#v", fake.calls)
+		}
+	})
+
+	t.Run("timeout removes an incomplete linear pool", func(t *testing.T) {
+		const incompletePool = `{
+			"report": [{
+				"lv": [{
+					"lv_name": "vg-thinpool",
+					"vg_name": "vg",
+					"lv_size": "1048576",
+					"segtype": "linear",
+					"origin": ""
+				}]
+			}]
+		}`
+		fake := &fakeCommandExecutor{
+			t: t,
+			results: []commandResult{
+				{command: "lvs", output: noVolumes},
+				{command: "lvs", output: noVolumes},
+				{command: "lvcreate", err: fmt.Errorf("slow device: %w", cmd.ErrCmdTimeout)},
+				{command: "lvs", output: incompletePool},
+				{command: "lvremove"},
+			},
+		}
+		useFakeCommandExecutor(t, fake)
+
+		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		if err == nil || !errors.Is(err, cmd.ErrCmdTimeout) {
+			t.Fatalf("expected thin-pool creation timeout, got %v", err)
+		}
+		if got, want := fake.calls[4].args, []string{"-q", "-y", "vg/vg-thinpool"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("unexpected rollback arguments: want %#v, got %#v", want, got)
+		}
+		if want := []time.Duration{15 * time.Minute}; !reflect.DeepEqual(fake.timeouts, want) {
+			t.Fatalf("unexpected thin-pool creation timeout: want %v, got %v", want, fake.timeouts)
 		}
 	})
 }
