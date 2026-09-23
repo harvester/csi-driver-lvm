@@ -17,26 +17,19 @@ limitations under the License.
 package lvm
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	cmd "github.com/harvester/go-common/command"
 	ioutil "github.com/harvester/go-common/io"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	k8serror "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -51,6 +44,7 @@ type Lvm struct {
 	provisionerImage  string
 	pullPolicy        v1.PullPolicy
 	namespace         string
+	helperConfig      HelperConfig
 
 	ids *identityServer
 	ns  *nodeServer
@@ -83,6 +77,7 @@ type volumeAction struct {
 	vgName           string
 	hostWritePath    string
 	srcInfo          *srcInfo
+	helperConfig     HelperConfig
 	//srcDev           string
 }
 
@@ -99,6 +94,7 @@ type snapshotAction struct {
 	vgName           string
 	lvType           string
 	hostWritePath    string
+	helperConfig     HelperConfig
 }
 
 const (
@@ -134,13 +130,49 @@ type timedCommandExecutor interface {
 }
 
 var (
+	commandTimeoutNanos  atomic.Int64
+	thinPoolTimeoutNanos atomic.Int64
+
 	newCommandExecutor = func() commandExecutor {
-		return cmd.NewExecutor()
+		executor := cmd.NewExecutor()
+		executor.SetTimeout(commandTimeout())
+		return executor
 	}
 	newUnmountExecutor = func() timedCommandExecutor {
 		return cmd.NewExecutor()
 	}
 )
+
+func init() {
+	commandTimeoutNanos.Store(int64(DefaultHelperCommandTimeout))
+	thinPoolTimeoutNanos.Store(int64(DefaultThinPoolCreateTimeout))
+}
+
+// SetCommandTimeout configures LVM commands run by the helper process.
+func SetCommandTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return fmt.Errorf("command timeout must be greater than zero")
+	}
+	commandTimeoutNanos.Store(int64(timeout))
+	return nil
+}
+
+func commandTimeout() time.Duration {
+	return time.Duration(commandTimeoutNanos.Load())
+}
+
+// SetThinPoolCreateTimeout configures initial thin-pool creation.
+func SetThinPoolCreateTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return fmt.Errorf("thin-pool creation timeout must be greater than zero")
+	}
+	thinPoolTimeoutNanos.Store(int64(timeout))
+	return nil
+}
+
+func thinPoolCreateTimeout() time.Duration {
+	return time.Duration(thinPoolTimeoutNanos.Load())
+}
 
 type wipefsReport struct {
 	Signatures *[]struct {
@@ -163,7 +195,12 @@ type logicalVolumeReport struct {
 }
 
 // NewLvmDriver creates the driver
-func NewLvmDriver(driverName, nodeID, endpoint string, hostWritePath string, maxVolumesPerNode int64, version string, namespace string, provisionerImage string, pullPolicy string) (*Lvm, error) {
+func NewLvmDriver(
+	driverName, nodeID, endpoint, hostWritePath string,
+	maxVolumesPerNode int64,
+	version, namespace, provisionerImage, pullPolicy string,
+	options ...DriverOption,
+) (*Lvm, error) {
 	if driverName == "" {
 		return nil, fmt.Errorf("no driver name provided")
 	}
@@ -188,7 +225,7 @@ func NewLvmDriver(driverName, nodeID, endpoint string, hostWritePath string, max
 	klog.Infof("Driver: %v ", driverName)
 	klog.Infof("Version: %s", vendorVersion)
 
-	return &Lvm{
+	driver := &Lvm{
 		name:              driverName,
 		version:           vendorVersion,
 		nodeID:            nodeID,
@@ -198,7 +235,14 @@ func NewLvmDriver(driverName, nodeID, endpoint string, hostWritePath string, max
 		namespace:         namespace,
 		provisionerImage:  provisionerImage,
 		pullPolicy:        pp,
-	}, nil
+		helperConfig:      DefaultHelperConfig(),
+	}
+	for _, option := range options {
+		if err := option(driver); err != nil {
+			return nil, fmt.Errorf("invalid driver option: %w", err)
+		}
+	}
+	return driver, nil
 }
 
 // Run starts the lvm plugin
@@ -210,7 +254,14 @@ func (lvm *Lvm) Run() error {
 	if err != nil {
 		return err
 	}
-	lvm.cs, err = newControllerServer(lvm.nodeID, lvm.hostWritePath, lvm.namespace, lvm.provisionerImage, lvm.pullPolicy)
+	lvm.cs, err = newControllerServer(
+		lvm.nodeID,
+		lvm.hostWritePath,
+		lvm.namespace,
+		lvm.provisionerImage,
+		lvm.pullPolicy,
+		lvm.helperConfig,
+	)
 	if err != nil {
 		return err
 	}
@@ -529,274 +580,6 @@ func isUnmountComplete(output string, err error) bool {
 	return strings.Contains(message, "not mounted") || strings.Contains(message, "no mount point specified")
 }
 
-func createSnapshotterPod(ctx context.Context, sa snapshotAction) error {
-	args, err := snapshotProvisionerArgs(sa)
-	if err != nil {
-		return err
-	}
-
-	klog.Infof("start snapshotterPod with args:%s", args)
-	action := fmt.Sprintf("snap-%s", sa.action)
-	pod := genProvisionerPodContent(action, sa.snapshotName, sa.nodeName, sa.hostWritePath, sa.provisionerImage, sa.pullPolicy, args)
-	if err := runProvisionerPod(ctx, sa.kubeClient.CoreV1().Pods(sa.namespace), pod, "snapshot", sa.action); err != nil {
-		return err
-	}
-
-	klog.Infof("Snapshot %v has been %vd on %v", sa.snapshotName, sa.action, sa.nodeName)
-	return nil
-}
-
-func snapshotProvisionerArgs(sa snapshotAction) ([]string, error) {
-	if sa.snapshotName == "" || sa.nodeName == "" {
-		klog.Errorf("invalid snapshotAction %v", sa)
-		return nil, fmt.Errorf("invalid empty name or path or node")
-	}
-	if sa.action == actionTypeCreate && sa.srcVolName == "" {
-		klog.Errorf("invalid snapshotAction %v", sa)
-		return nil, fmt.Errorf("createlv without srcVolName")
-	}
-
-	switch sa.action {
-	case actionTypeCreate:
-		return []string{"createsnap", "--snapname", sa.snapshotName, "--lvname", sa.srcVolName, "--vgname", sa.vgName, "--lvsize", fmt.Sprintf("%d", sa.snapSize), "--lvmtype", sa.lvType}, nil
-	case actionTypeDelete:
-		return []string{"deletesnap", "--snapname", sa.snapshotName, "--vgname", sa.vgName}, nil
-	default:
-		return nil, fmt.Errorf("invalid action %q", sa.action)
-	}
-}
-
-func createProvisionerPod(ctx context.Context, va volumeAction) error {
-	args, err := volumeProvisionerArgs(va)
-	if err != nil {
-		return err
-	}
-
-	klog.Infof("start provisionerPod with args:%s", args)
-	action := fmt.Sprintf("lvm-%s", va.action)
-	pod := genProvisionerPodContent(action, va.name, va.nodeName, va.hostWritePath, va.provisionerImage, va.pullPolicy, args)
-	if err := runProvisionerPod(ctx, va.kubeClient.CoreV1().Pods(va.namespace), pod, "volume", va.action); err != nil {
-		return err
-	}
-
-	klog.Infof("Volume %v has been %vd on %v", va.name, va.action, va.nodeName)
-	return nil
-}
-
-func volumeProvisionerArgs(va volumeAction) ([]string, error) {
-	if va.name == "" || va.nodeName == "" {
-		return nil, fmt.Errorf("invalid empty name or path or node")
-	}
-	if va.action == actionTypeCreate && va.lvmType == "" {
-		return nil, fmt.Errorf("createlv without lvm type")
-	}
-
-	var args []string
-	switch va.action {
-	case actionTypeCreate:
-		args = append(args, "createlv", "--lvsize", fmt.Sprintf("%d", va.size), "--lvmtype", va.lvmType, "--vgname", va.vgName)
-	case actionTypeDelete:
-		if va.srcInfo == nil {
-			return nil, fmt.Errorf("deletelv without source volume information")
-		}
-		args = append(args, "deletelv", "--srcvgname", va.srcInfo.srcVGName, "--srctype", va.srcInfo.srcType)
-	case actionTypeClone:
-		if va.srcInfo == nil {
-			return nil, fmt.Errorf("clonelv without source volume information")
-		}
-		args = append(args, "clonelv", "--srclvname", va.srcInfo.srcLVName, "--srcvgname", va.srcInfo.srcVGName, "--srctype", va.srcInfo.srcType, "--lvsize", fmt.Sprintf("%d", va.size), "--vgname", va.vgName, "--lvmtype", va.lvmType)
-	default:
-		return nil, fmt.Errorf("invalid action %q", va.action)
-	}
-	return append(args, "--lvname", va.name), nil
-}
-
-func runProvisionerPod(ctx context.Context, pods corev1.PodInterface, pod *v1.Pod, resource string, action actionType) error {
-	if err := ensureProvisionerPod(ctx, pods, pod); err != nil {
-		return err
-	}
-
-	terminal, err := waitForProvisionerPod(ctx, pods, pod.Name, resource, action)
-	if !terminal {
-		klog.Infof("retaining nonterminal provisioner pod %s for a later retry: %v", pod.Name, err)
-		return err
-	}
-
-	deleteProvisionerPod(pods, pod.Name)
-	return err
-}
-
-func ensureProvisionerPod(ctx context.Context, pods corev1.PodInterface, pod *v1.Pod) error {
-	_, err := pods.Create(ctx, pod, metav1.CreateOptions{})
-	if err == nil {
-		return nil
-	}
-	if !k8serror.IsAlreadyExists(err) {
-		return err
-	}
-	return reuseProvisionerPod(ctx, pods, pod)
-}
-
-func reuseProvisionerPod(ctx context.Context, pods corev1.PodInterface, desired *v1.Pod) error {
-	existing, err := pods.Get(ctx, desired.Name, metav1.GetOptions{})
-	if err != nil {
-		return status.Errorf(codes.Unavailable, "failed to get existing provisioner pod %q: %v", desired.Name, err)
-	}
-	if existing == nil {
-		return status.Errorf(
-			codes.Unavailable,
-			"Kubernetes API returned an empty provisioner pod %q",
-			desired.Name,
-		)
-	}
-	if existing.DeletionTimestamp != nil {
-		return forceDeletePod(ctx, pods, existing.Name)
-	}
-	if apiequality.Semantic.DeepDerivative(desired.Spec, existing.Spec) {
-		klog.Infof("reusing existing provisioner pod %s", desired.Name)
-		return nil
-	}
-	return retireProvisionerPod(ctx, pods, existing)
-}
-
-func forceDeletePod(ctx context.Context, pods corev1.PodInterface, podName string) error {
-	gracePeriod := int64(0)
-	options := metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod}
-	if err := pods.Delete(ctx, podName, options); err != nil && !k8serror.IsNotFound(err) {
-		return status.Errorf(codes.Unavailable, "failed to force-delete provisioner pod %q: %v", podName, err)
-	}
-	return status.Errorf(codes.Unavailable, "force-deleted provisioner pod %q; retry the request", podName)
-}
-
-func retireProvisionerPod(ctx context.Context, pods corev1.PodInterface, pod *v1.Pod) error {
-	if !podTerminal(pod) {
-		// Do not interrupt an LVM operation that may still be in progress.
-		return status.Errorf(
-			codes.Unavailable,
-			"provisioner pod %q belongs to a different request and is still %q",
-			pod.Name,
-			valueOrUnknown(string(pod.Status.Phase)),
-		)
-	}
-	if err := pods.Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil && !k8serror.IsNotFound(err) {
-		return status.Errorf(codes.Unavailable, "failed to delete stale provisioner pod %q: %v", pod.Name, err)
-	}
-	return status.Errorf(codes.Unavailable, "removed stale provisioner pod %q; retry the request", pod.Name)
-}
-
-func podTerminal(pod *v1.Pod) bool {
-	return pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed
-}
-
-func waitForProvisionerPod(ctx context.Context, pods corev1.PodInterface, podName, resource string, action actionType) (bool, error) {
-	const provisionerPodPollAttempts = 60
-	for range provisionerPodPollAttempts {
-		pod, readErr := pods.Get(ctx, podName, metav1.GetOptions{})
-		terminal, resultErr := provisionerPodResult(ctx, pod, readErr, resource, action)
-		if terminal || resultErr != nil {
-			return terminal, resultErr
-		}
-		if err := waitForRetry(ctx); err != nil {
-			return false, err
-		}
-	}
-	return false, fmt.Errorf("%s %s process timeout after %d polling attempts", resource, action, provisionerPodPollAttempts)
-}
-
-func provisionerPodResult(ctx context.Context, pod *v1.Pod, readErr error, resource string, action actionType) (bool, error) {
-	if readErr != nil {
-		if ctx.Err() != nil {
-			return false, status.FromContextError(ctx.Err()).Err()
-		}
-		klog.Errorf("error reading provisioner pod: %v", readErr)
-		return false, nil
-	}
-	if pod == nil {
-		return false, status.Error(codes.Internal, "Kubernetes API returned an empty provisioner pod")
-	}
-
-	switch pod.Status.Phase {
-	case v1.PodFailed:
-		klog.Infof("provisioner pod %s terminated with failure", pod.Name)
-		return true, provisionerPodFailure(pod, resource, action)
-	case v1.PodSucceeded:
-		klog.Infof("provisioner pod %s terminated successfully", pod.Name)
-		return true, nil
-	default:
-		klog.Infof("provisioner pod %s status:%s", pod.Name, pod.Status.Phase)
-		return false, nil
-	}
-}
-
-func provisionerPodFailure(pod *v1.Pod, resource string, action actionType) error {
-	details := make([]string, 0, len(pod.Status.ContainerStatuses)+1)
-	if pod.Status.Reason != "" || pod.Status.Message != "" {
-		details = append(details, fmt.Sprintf(
-			"pod reason=%s message=%s",
-			valueOrUnknown(pod.Status.Reason),
-			valueOrUnknown(compactErrorMessage(pod.Status.Message)),
-		))
-	}
-	for _, containerStatus := range pod.Status.ContainerStatuses {
-		terminated := containerStatus.State.Terminated
-		if terminated == nil {
-			continue
-		}
-		detail := fmt.Sprintf(
-			"container %s exited with code %d reason=%s",
-			containerStatus.Name,
-			terminated.ExitCode,
-			valueOrUnknown(terminated.Reason),
-		)
-		if message := compactErrorMessage(terminated.Message); message != "" {
-			detail += " message=" + message
-		}
-		details = append(details, detail)
-	}
-
-	message := fmt.Sprintf("%s %s helper pod %s failed", resource, action, pod.Name)
-	if len(details) > 0 {
-		message += ": " + strings.Join(details, "; ")
-	}
-	return status.Error(codes.Internal, message)
-}
-
-func compactErrorMessage(message string) string {
-	const maxLength = 1024
-	message = strings.Join(strings.Fields(message), " ")
-	runes := []rune(message)
-	if len(runes) <= maxLength {
-		return message
-	}
-	return string(runes[:maxLength]) + "..."
-}
-
-func valueOrUnknown(value string) string {
-	if value == "" {
-		return "unknown"
-	}
-	return value
-}
-
-func deleteProvisionerPod(pods corev1.PodInterface, podName string) {
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := pods.Delete(cleanupCtx, podName, metav1.DeleteOptions{}); err != nil && !k8serror.IsNotFound(err) {
-		klog.Errorf("unable to delete provisioner pod %s: %v", podName, err)
-	}
-}
-
-func waitForRetry(ctx context.Context) error {
-	timer := time.NewTimer(time.Second)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return status.FromContextError(ctx.Err()).Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
 // VgExists checks if the given volume group exists
 func VgExists(vgname string) bool {
 	executor := newCommandExecutor()
@@ -920,20 +703,118 @@ func prepareThinPool(vgName, lvmType string) (string, error) {
 	}
 
 	thinPoolName := fmt.Sprintf("%s-thinpool", vgName)
-	found, err := getThinPool(vgName, thinPoolName)
+	pool, found, err := getLogicalVolume(vgName, thinPoolName)
 	if err != nil {
 		return "", fmt.Errorf("unable to determine if thin pool %q/%q exists: %w", vgName, thinPoolName, err)
 	}
 	if found {
-		return thinPoolName, validateThinPool(vgName, thinPoolName)
+		return thinPoolName, checkThinPool(pool)
 	}
 
+	return thinPoolName, createThinPool(vgName, thinPoolName)
+}
+
+func checkThinPool(pool logicalVolume) error {
+	if pool.SegType != ThinPoolType {
+		return fmt.Errorf(
+			"thin pool %q/%q is incomplete: expected segment type %q, found %q",
+			pool.VGName,
+			pool.Name,
+			ThinPoolType,
+			pool.SegType,
+		)
+	}
+	return validateThinPool(pool.VGName, pool.Name)
+}
+
+func createThinPool(vgName, thinPoolName string) error {
 	args := thinPoolCreateArgs(vgName, thinPoolName)
 	klog.Infof("lvcreate %s", args)
-	if _, err := newCommandExecutor().Execute("lvcreate", args); err != nil {
-		return "", fmt.Errorf("unable to create thin pool %q/%q: %w", vgName, thinPoolName, err)
+	executor := newCommandExecutor()
+	timedExecutor, ok := executor.(timedCommandExecutor)
+	if !ok {
+		return fmt.Errorf("lvcreate executor does not support command timeouts")
 	}
-	return thinPoolName, nil
+	timedExecutor.SetTimeout(thinPoolCreateTimeout())
+	_, err := timedExecutor.Execute("lvcreate", args)
+	if err == nil {
+		return nil
+	}
+	return handleThinPoolCreateError(vgName, thinPoolName, err)
+}
+
+func handleThinPoolCreateError(vgName, thinPoolName string, createErr error) error {
+	if !errors.Is(createErr, cmd.ErrCmdTimeout) {
+		return thinPoolCreateError(vgName, thinPoolName, createErr)
+	}
+
+	rollbackErr := rollbackThinPoolCreate(vgName, thinPoolName)
+	if rollbackErr == nil {
+		return thinPoolCreateError(vgName, thinPoolName, createErr)
+	}
+	return fmt.Errorf(
+		"unable to create thin pool %q/%q: %w; rollback failed: %v",
+		vgName,
+		thinPoolName,
+		createErr,
+		rollbackErr,
+	)
+}
+
+func thinPoolCreateError(vgName, thinPoolName string, err error) error {
+	return fmt.Errorf(
+		"unable to create thin pool %q/%q: %w",
+		vgName,
+		thinPoolName,
+		err,
+	)
+}
+
+func rollbackThinPoolCreate(vgName, thinPoolName string) error {
+	pool, found, err := getLogicalVolume(vgName, thinPoolName)
+	if err != nil {
+		return fmt.Errorf("unable to inspect timed-out thin-pool creation: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	if pool.SegType == ThinPoolType {
+		klog.Infof(
+			"thin pool %s/%s exists after lvcreate timeout; preserving it for retry validation",
+			vgName,
+			thinPoolName,
+		)
+		return nil
+	}
+	if pool.SegType != LinearType {
+		return fmt.Errorf(
+			"refusing to remove logical volume %q/%q with unexpected segment type %q",
+			vgName,
+			thinPoolName,
+			pool.SegType,
+		)
+	}
+
+	args := []string{
+		"-q",
+		"-y",
+		fmt.Sprintf("%s/%s", vgName, thinPoolName),
+	}
+	klog.Warningf(
+		"removing incomplete thin pool after lvcreate timeout: lvremove %s",
+		args,
+	)
+	out, err := newCommandExecutor().Execute("lvremove", args)
+	if err != nil {
+		return fmt.Errorf(
+			"unable to remove incomplete logical volume %q/%q: %w output:%s",
+			vgName,
+			thinPoolName,
+			err,
+			out,
+		)
+	}
+	return nil
 }
 
 func thinPoolCreateArgs(vg, thinPoolName string) []string {
@@ -1329,17 +1210,6 @@ func getThinPoolAndCounts(vgName string) (map[string]int, error) {
 	return thinInfo, nil
 }
 
-func getThinPool(vgName, thinpoolName string) (bool, error) {
-	thinPoolInfo, err := getThinPoolAndCounts(vgName)
-	if err != nil {
-		return false, err
-	}
-	if _, ok := thinPoolInfo[thinpoolName]; ok {
-		return true, nil
-	}
-	return false, nil
-}
-
 func validateThinPool(vgName, thinpoolName string) error {
 	executor := newCommandExecutor()
 	args := []string{
@@ -1363,149 +1233,4 @@ func validateThinPool(vgName, thinpoolName string) error {
 		return fmt.Errorf("thin pool %q/%q is unhealthy: %q", vgName, thinpoolName, strings.Join(fields[1:], " "))
 	}
 	return nil
-}
-
-func genProvisionerPodContent(
-	action, name, targetNode, hostWritePath, provisionerImage string,
-	pullPolicy v1.PullPolicy,
-	args []string,
-) *v1.Pod {
-	hostPathTypeDirOrCreate := v1.HostPathDirectoryOrCreate
-	hostPathTypeDirectory := v1.HostPathDirectory
-	privileged := true
-	mountPropagationBidirectional := v1.MountPropagationBidirectional
-	targetPod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: string(action) + "-" + name,
-		},
-		Spec: v1.PodSpec{
-			RestartPolicy: v1.RestartPolicyNever,
-			NodeName:      targetNode,
-			Tolerations: []v1.Toleration{
-				{
-					Operator: v1.TolerationOpExists,
-				},
-			},
-			Containers: []v1.Container{
-				{
-					Name:    "csi-lvmplugin-" + string(action),
-					Image:   provisionerImage,
-					Command: []string{"csi-lvmplugin-provisioner"},
-					Args:    args,
-					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:             "devices",
-							ReadOnly:         false,
-							MountPath:        "/dev",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:      "modules",
-							ReadOnly:  false,
-							MountPath: "/lib/modules",
-						},
-						{
-							Name:             "lvmbackup",
-							ReadOnly:         false,
-							MountPath:        "/etc/lvm/backup",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:             "lvmcache",
-							ReadOnly:         false,
-							MountPath:        "/etc/lvm/cache",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:             "lvmlock",
-							ReadOnly:         false,
-							MountPath:        "/run/lock/lvm",
-							MountPropagation: &mountPropagationBidirectional,
-						},
-						{
-							Name:      "host-lvm-conf",
-							ReadOnly:  true,
-							MountPath: "/etc/lvm/lvm.conf",
-						},
-						{
-							Name:      "host-run-udev",
-							ReadOnly:  true,
-							MountPath: "/run/udev",
-						},
-					},
-					TerminationMessagePath:   "/termination.log",
-					TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
-					ImagePullPolicy:          pullPolicy,
-					SecurityContext: &v1.SecurityContext{
-						Privileged: &privileged,
-					},
-				},
-			},
-			Volumes: []v1.Volume{
-				{
-					Name: "devices",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/dev",
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "modules",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/lib/modules",
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "lvmbackup",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: filepath.Join(hostWritePath, "backup"),
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "lvmcache",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: filepath.Join(hostWritePath, "cache"),
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "lvmlock",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: filepath.Join(hostWritePath, "lock"),
-							Type: &hostPathTypeDirOrCreate,
-						},
-					},
-				},
-				{
-					Name: "host-lvm-conf",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/etc/lvm/lvm.conf",
-						},
-					},
-				},
-				{
-					Name: "host-run-udev",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/run/udev",
-							Type: &hostPathTypeDirectory,
-						},
-					},
-				},
-			},
-		},
-	}
-	return targetPod
 }
