@@ -34,15 +34,48 @@ func init() {
 }
 
 var (
-	endpoint          = flag.String("endpoint", "unix://tmp/csi.sock", "CSI endpoint")
-	hostWritePath     = flag.String("hostwritepath", "/etc/lvm", "host path where config, cache & backups will be written to")
+	endpoint      = flag.String("endpoint", "unix://tmp/csi.sock", "CSI endpoint")
+	hostWritePath = flag.String(
+		"hostwritepath",
+		"/etc/lvm",
+		"host path where config, cache & backups will be written to",
+	)
 	driverName        = flag.String("drivername", "harvester-csi-driver-lvm", "name of the driver")
 	nodeID            = flag.String("nodeid", "", "node id")
 	maxVolumesPerNode = flag.Int64("maxvolumespernode", 0, "limit of volumes per node")
 	showVersion       = flag.Bool("version", false, "Show version.")
 	namespace         = flag.String("namespace", "csi-lvm", "name of namespace")
-	provisionerImage  = flag.String("provisionerimage", "metalstack/csi-lvmplugin-provisioner", "name of provisioner image")
-	pullPolicy        = flag.String("pullpolicy", "ifnotpresent", "pull policy for provisioner image")
+	provisionerImage  = flag.String(
+		"provisionerimage",
+		"metalstack/csi-lvmplugin-provisioner",
+		"name of provisioner image",
+	)
+	pullPolicy           = flag.String("pullpolicy", "ifnotpresent", "pull policy for provisioner image")
+	helperCommandTimeout = flag.Duration(
+		"helper-command-timeout",
+		lvm.DefaultHelperCommandTimeout,
+		"timeout for each LVM command run by a helper pod",
+	)
+	helperPodTimeout = flag.Duration(
+		"helper-pod-timeout",
+		lvm.DefaultHelperPodTimeout,
+		"deadline for a controller-side LVM helper pod",
+	)
+	thinPoolCreateTimeout = flag.Duration(
+		"thin-pool-create-timeout",
+		lvm.DefaultThinPoolCreateTimeout,
+		"timeout for initial thin-pool creation",
+	)
+	thinPoolHelperPodTimeout = flag.Duration(
+		"thin-pool-helper-pod-timeout",
+		lvm.DefaultThinPoolPodTimeout,
+		"deadline for a dm-thin volume creation helper pod",
+	)
+	maxActiveHelpers = flag.Int(
+		"max-active-helpers-per-node-vg",
+		lvm.DefaultMaxActiveHelpers,
+		"maximum Pending or Running LVM helper pods per node and volume group",
+	)
 
 	// Set by the build process
 	version = ""
@@ -62,7 +95,25 @@ func main() {
 }
 
 func handle() {
-	driver, err := lvm.NewLvmDriver(*driverName, *nodeID, *endpoint, *hostWritePath, *maxVolumesPerNode, version, *namespace, *provisionerImage, *pullPolicy)
+	helperConfig := lvm.HelperConfig{
+		CommandTimeout:        *helperCommandTimeout,
+		PodTimeout:            *helperPodTimeout,
+		ThinPoolCreateTimeout: *thinPoolCreateTimeout,
+		ThinPoolPodTimeout:    *thinPoolHelperPodTimeout,
+		MaxActive:             *maxActiveHelpers,
+	}
+	driver, err := lvm.NewLvmDriver(
+		*driverName,
+		*nodeID,
+		*endpoint,
+		*hostWritePath,
+		*maxVolumesPerNode,
+		version,
+		*namespace,
+		*provisionerImage,
+		*pullPolicy,
+		lvm.WithHelperConfig(helperConfig),
+	)
 	if err != nil {
 		fmt.Printf("Failed to initialize driver: %s\n", err.Error())
 		os.Exit(1)

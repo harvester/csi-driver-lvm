@@ -23,6 +23,13 @@ creates a `<vg-name>-thinpool` thin pool using 90% of the free extents, a 512
 KiB chunk size, 16 GiB of metadata, and an enabled volume-group metadata spare.
 Existing thin pools are used as-is and are not modified by the driver.
 
+Controller-side LVM work runs in short-lived helper pods. The chart limits
+active helpers per node and volume group, including helpers retained after a
+timed-out CSI request. Ordinary operations use a `3m` command timeout and a
+`3m30s` helper pod deadline. Initial thin-pool creation uses a longer `15m`
+command timeout and an `18m` helper pod deadline. The provisioner uses a `4m`
+CSI timeout; slow dm-thin helpers are retained and reused by later retries.
+
 ## Installation ##
 
 You can use Helm to install the Harvester-CSI-Driver-LVM by remote repo or local helm chart files.
