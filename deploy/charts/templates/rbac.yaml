@@ -1,8 +1,20 @@
 ---
+# Controller (StatefulSet) identity. The controller sidecars are the only part
+# of the driver that reads Secrets, so it is the only identity bound to
+# harvester-csi-driver-lvm-encryption-secrets below.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: harvester-csi-driver-lvm
+---
+# Node plugin (DaemonSet) identity. Kept separate from the controller's so the
+# privileged per-node pods do not inherit its Secret access: the node plugin
+# receives encryption secrets in the CSI request from kubelet and never reads
+# them from the API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: harvester-csi-driver-lvm-node
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -50,6 +62,55 @@ roleRef:
   name: harvester-csi-driver-lvm
   apiGroup: rbac.authorization.k8s.io
 ---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: harvester-csi-driver-lvm-node
+subjects:
+  - kind: ServiceAccount
+    name: harvester-csi-driver-lvm-node
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: harvester-csi-driver-lvm
+  apiGroup: rbac.authorization.k8s.io
+---
+# Encryption at rest: the external-provisioner sidecar resolves the
+# csi.storage.k8s.io/provisioner-secret-name/-namespace an encrypted
+# StorageClass references, so it needs to read that Secret. The reference may
+# point at any namespace, so the rule has to be cluster-wide; it is a separate
+# ClusterRole bound only to the controller, so the privileged node DaemonSet
+# does not get read access to every Secret in the cluster.
+#
+# Cluster-wide Secret reads make the provisioner a potential confused deputy: it
+# resolves the reference with its own identity, not the identity of whoever
+# created the PVC. Authorizing that is out of reach here - CSI hands the driver
+# the resolved Secret contents, never the reference or the requesting user - so
+# it belongs in PVC admission, which can resolve the reference and issue a
+# SubjectAccessReview for the requesting user. Tracked in
+# https://github.com/harvester/harvester/issues/11558.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: harvester-csi-driver-lvm-encryption-secrets
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: harvester-csi-driver-lvm-encryption-secrets
+subjects:
+  - kind: ServiceAccount
+    name: harvester-csi-driver-lvm
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: harvester-csi-driver-lvm-encryption-secrets
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -65,9 +126,13 @@ kind: RoleBinding
 metadata:
   name: harvester-csi-driver-lvm-snapshot-locations
   namespace: {{ .Release.Namespace }}
+# The driver process serving the controller service runs in the node DaemonSet -
+# the controller StatefulSet holds only the CSI sidecars, which reach it over the
+# shared host socket - so the node identity is the one that records snapshot
+# locations.
 subjects:
   - kind: ServiceAccount
-    name: harvester-csi-driver-lvm
+    name: harvester-csi-driver-lvm-node
     namespace: {{ .Release.Namespace }}
 roleRef:
   kind: Role
