@@ -45,6 +45,7 @@ type controllerServer struct {
 	pullPolicy       v1.PullPolicy
 	namespace        string
 	snapClient       snapclient.Interface
+	helperConfig     HelperConfig
 }
 
 const (
@@ -59,7 +60,11 @@ const (
 )
 
 // NewControllerServer
-func newControllerServer(nodeID string, hostWritePath string, namespace string, provisionerImage string, pullPolicy v1.PullPolicy) (*controllerServer, error) {
+func newControllerServer(
+	nodeID, hostWritePath, namespace, provisionerImage string,
+	pullPolicy v1.PullPolicy,
+	helperConfig HelperConfig,
+) (*controllerServer, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, err
@@ -91,6 +96,7 @@ func newControllerServer(nodeID string, hostWritePath string, namespace string, 
 		provisionerImage: provisionerImage,
 		pullPolicy:       pullPolicy,
 		snapClient:       snapClient,
+		helperConfig:     helperConfig,
 	}, nil
 }
 
@@ -153,7 +159,7 @@ func (cs *controllerServer) provisionVolume(
 	}
 
 	action := cs.newCreateVolumeAction(req.GetName(), node, lvmType, vgName, requiredBytes)
-	if err := createProvisionerPod(ctx, action); err != nil {
+	if err := createVolumeHelper(ctx, action); err != nil {
 		klog.Errorf("error creating provisioner pod: %v", err)
 		return err
 	}
@@ -236,6 +242,7 @@ func (cs *controllerServer) newCreateVolumeAction(name, node, lvmType, vgName st
 		namespace:        cs.namespace,
 		vgName:           vgName,
 		hostWritePath:    cs.hostWritePath,
+		helperConfig:     cs.helperConfig,
 	}
 }
 
@@ -289,6 +296,7 @@ func (cs *controllerServer) newCloneVolumeAction(
 		vgName:           dstVGName,
 		hostWritePath:    cs.hostWritePath,
 		srcInfo:          source,
+		helperConfig:     cs.helperConfig,
 	}, nil
 }
 
@@ -332,7 +340,7 @@ func (cs *controllerServer) cloneFromDynamicSnapshot(
 		return err
 	}
 
-	if err := createProvisionerPod(ctx, va); err != nil {
+	if err := createVolumeHelper(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return err
 	}
@@ -358,7 +366,7 @@ func (cs *controllerServer) cloneFromPreProvisionedSnapshot(
 	if err != nil {
 		return err
 	}
-	if err := createProvisionerPod(ctx, action); err != nil {
+	if err := createVolumeHelper(ctx, action); err != nil {
 		klog.Errorf("error creating provisioner pod: %v", err)
 		return err
 	}
@@ -411,7 +419,7 @@ func (cs *controllerServer) cloneFromVolume(
 		return err
 	}
 
-	if err := createProvisionerPod(ctx, va); err != nil {
+	if err := createVolumeHelper(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return err
 	}
@@ -454,7 +462,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 
 	va := cs.newDeleteVolumeAction(volID, nodeName, vgName, lvmType)
-	if err := createProvisionerPod(ctx, va); err != nil {
+	if err := createVolumeHelper(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return nil, err
 	}
@@ -498,6 +506,8 @@ func (cs *controllerServer) newDeleteVolumeAction(volumeID, nodeName, vgName, lv
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
 		hostWritePath:    cs.hostWritePath,
+		vgName:           vgName,
+		helperConfig:     cs.helperConfig,
 		srcInfo: &srcInfo{
 			srcLVName: volumeID,
 			srcVGName: vgName,
@@ -618,7 +628,7 @@ func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	}
 
 	action := cs.newCreateSnapshotAction(snapshotName, volumeID, nodeName, vgName, lvmType, snapSize)
-	if err := createSnapshotterPod(ctx, action); err != nil {
+	if err := createSnapshotHelper(ctx, action); err != nil {
 		klog.Errorf("error creating provisioner pod: %v", err)
 		return nil, err
 	}
@@ -643,6 +653,7 @@ func (cs *controllerServer) newCreateSnapshotAction(
 		namespace:        cs.namespace,
 		provisionerImage: cs.provisionerImage,
 		pullPolicy:       cs.pullPolicy,
+		helperConfig:     cs.helperConfig,
 	}
 }
 
@@ -684,7 +695,7 @@ func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 		return &csi.DeleteSnapshotResponse{}, nil
 	}
 
-	if err := createSnapshotterPod(ctx, *action); err != nil {
+	if err := createSnapshotHelper(ctx, *action); err != nil {
 		klog.Errorf("error creating provisioner pod: %v", err)
 		return nil, err
 	}
@@ -1052,6 +1063,7 @@ func (cs *controllerServer) newDeleteSnapshotAction(snapshotID, nodeName, vgName
 		namespace:        cs.namespace,
 		provisionerImage: cs.provisionerImage,
 		pullPolicy:       cs.pullPolicy,
+		helperConfig:     cs.helperConfig,
 	}
 }
 
