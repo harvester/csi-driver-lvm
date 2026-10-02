@@ -66,15 +66,7 @@ func (f *fakeCoreV1) ConfigMaps(_ string) corev1.ConfigMapInterface {
 // pod: the RPC fails with an ordinary error instead of dereferencing the
 // unimplemented embedded interface.
 func (f *fakeCoreV1) Pods(_ string) corev1.PodInterface {
-	return &fakePods{}
-}
-
-type fakePods struct {
-	corev1.PodInterface
-}
-
-func (f *fakePods) Create(_ context.Context, _ *v1.Pod, _ metav1.CreateOptions) (*v1.Pod, error) {
-	return nil, errors.New("the fake client does not run provisioner pods")
+	return &fakePods{createErr: errors.New("the fake client does not run provisioner pods")}
 }
 
 type fakePersistentVolumes struct {
