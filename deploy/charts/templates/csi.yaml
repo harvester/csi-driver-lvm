@@ -15,7 +15,7 @@ spec:
       labels:
         {{- include "harvester-csi-driver-lvm.labels" . | nindent 8 }}
     spec:
-      serviceAccountName: harvester-csi-driver-lvm
+      serviceAccountName: harvester-csi-driver-lvm-node
 {{- if .Values.tolerations.plugin }}
       tolerations:
 {{ toYaml .Values.tolerations.plugin | indent 8 }}
