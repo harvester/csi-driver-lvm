@@ -30,7 +30,7 @@ endif
 
 BANNER = @printf "$(BOLD)$(CYAN)[target: $@]$(RESET)\n"
 
-DOCKER_BUILD = docker buildx build --platform $(MK_PLATFORMS) \
+DOCKER_BUILD = docker buildx build $(MK_DOCKER_PULL) --platform $(MK_PLATFORMS) \
     --progress=$(MK_DOCKER_PROGRESS) \
     --build-arg MK_REPO_ID \
     -f $(ROOT)/Dockerfile $(ROOT)
@@ -70,15 +70,15 @@ validate-ci: gen-version-env
 	$(DOCKER_BUILD) --target validate-ci
 
 # ---- package ----
-package-lvmplugin:
+package-lvmplugin: build
 	$(BANNER)
 	ARCH=$(MK_HOST_ARCH) $(ROOT)/scripts/package_lvmplugin
 
-package-lvm-provisioner:
+package-lvm-provisioner: build
 	$(BANNER)
 	ARCH=$(MK_HOST_ARCH) $(ROOT)/scripts/package_lvm_provisioner
 
-package-lvm-webhook:
+package-lvm-webhook: build
 	$(BANNER)
 	ARCH=$(MK_HOST_ARCH) $(ROOT)/scripts/package_lvm_webhook
 
