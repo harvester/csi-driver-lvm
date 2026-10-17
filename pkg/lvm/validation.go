@@ -46,11 +46,21 @@ func parseLVMParameters(parameters map[string]string) (string, string, error) {
 	return lvmType, vgName, nil
 }
 
+// lvSizeAlignment is the granularity lvcreate and lvextend accept for byte sizes.
+const lvSizeAlignment = 512
+
+// validateCapacityRange returns the required bytes rounded up to lvSizeAlignment.
+// CDI computes sizes with a filesystem overhead, so requests are often not aligned
+// and lvcreate rejects them with "Size is not a multiple of 512".
 func validateCapacityRange(capacityRange *csi.CapacityRange) (int64, error) {
 	if capacityRange == nil || capacityRange.GetRequiredBytes() <= 0 {
 		return 0, fmt.Errorf("capacity range with required bytes greater than zero is required")
 	}
-	return capacityRange.GetRequiredBytes(), nil
+	size := (capacityRange.GetRequiredBytes() + lvSizeAlignment - 1) / lvSizeAlignment * lvSizeAlignment
+	if limit := capacityRange.GetLimitBytes(); limit > 0 && size > limit {
+		return 0, fmt.Errorf("required bytes %d rounded up to %d exceed limit bytes %d", capacityRange.GetRequiredBytes(), size, limit)
+	}
+	return size, nil
 }
 
 func validateCreateSnapshotRequest(req *csi.CreateSnapshotRequest) (string, string, error) {

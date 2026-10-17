@@ -172,6 +172,21 @@ func TestValidateCapacityRange(t *testing.T) {
 			capacityRange: &csi.CapacityRange{RequiredBytes: 1048576},
 			want:          1048576,
 		},
+		{
+			name:          "unaligned required bytes are rounded up",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 8829681009},
+			want:          8829681152,
+		},
+		{
+			name:          "rounded size within limit",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 1000, LimitBytes: 1024},
+			want:          1024,
+		},
+		{
+			name:          "rounded size exceeds limit",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 1000, LimitBytes: 1000},
+			wantErr:       true,
+		},
 	}
 
 	for _, tt := range tests {
