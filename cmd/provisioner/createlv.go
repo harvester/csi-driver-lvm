@@ -29,10 +29,11 @@ func createLVCmd() *cli.Command {
 				Name:  flagLVMType,
 				Usage: "Required. type of lvs, can be either striped or mirrored",
 			},
+			lvLimitFlag(),
 		},
 		Action: func(c *cli.Context) error {
 			if err := createLV(c); err != nil {
-				klog.Fatalf("Error creating lv: %v", err)
+				exitWithError("Error creating lv", err)
 				return err
 			}
 			return nil
@@ -58,16 +59,18 @@ func createLV(c *cli.Context) error {
 		return fmt.Errorf("invalid empty flag %v", flagLVMType)
 	}
 
-	klog.Infof("create lv %s size:%d vg:%s type:%s", lvName, lvSize, vgName, lvmType)
+	lvLimit := c.Uint64(flagLVLimit)
+
+	klog.Infof("create lv %s size:%d limit:%d vg:%s type:%s", lvName, lvSize, lvLimit, vgName, lvmType)
 
 	if err := lvm.EnsureVG(vgName); err != nil {
 		return err
 	}
 
-	output, err := lvm.CreateLVS(vgName, lvName, lvSize, lvmType)
+	output, err := lvm.CreateLVS(vgName, lvName, lvSize, lvLimit, lvmType)
 	if err != nil {
 		return fmt.Errorf("unable to create lv: %w output:%s", err, output)
 	}
 	klog.Infof("lv: %s created, vg:%s size:%d type:%s", lvName, vgName, lvSize, lvmType)
-	return nil
+	return reportVolumeSize(vgName, lvName)
 }

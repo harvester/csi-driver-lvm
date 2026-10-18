@@ -123,6 +123,47 @@ func TestVolumeHelperArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("create passes a non-zero limit", func(t *testing.T) {
+		args, err := volumeHelperArgs(volumeAction{
+			action:   actionTypeCreate,
+			name:     "volume",
+			nodeName: "node-a",
+			size:     1048576,
+			limit:    4194304,
+			lvmType:  DmThinType,
+			vgName:   "vg",
+		})
+		if err != nil {
+			t.Fatalf("volumeHelperArgs failed: %v", err)
+		}
+		want := []string{
+			"createlv", "--lvsize", "1048576", "--lvmtype", DmThinType,
+			"--vgname", "vg", "--lvname", "volume", "--lvlimit", "4194304",
+		}
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("unexpected arguments: want %#v, got %#v", want, args)
+		}
+	})
+
+	t.Run("clone passes a non-zero limit", func(t *testing.T) {
+		args, err := volumeHelperArgs(volumeAction{
+			action:   actionTypeClone,
+			name:     "volume",
+			nodeName: "node-a",
+			size:     1048576,
+			limit:    4194304,
+			lvmType:  DmThinType,
+			vgName:   "vg",
+			srcInfo:  &srcInfo{srcLVName: "source", srcVGName: "vg", srcType: DmThinType},
+		})
+		if err != nil {
+			t.Fatalf("volumeHelperArgs failed: %v", err)
+		}
+		if got := args[len(args)-2:]; !reflect.DeepEqual(got, []string{"--lvlimit", "4194304"}) {
+			t.Fatalf("expected limit arguments at the end, got %#v", args)
+		}
+	})
+
 	t.Run("delete requires source metadata", func(t *testing.T) {
 		_, err := volumeHelperArgs(volumeAction{
 			action:   actionTypeDelete,
@@ -237,7 +278,7 @@ func TestRunHelper(t *testing.T) {
 			onGet: cancel,
 		}
 
-		err := runHelper(
+		_, err := runHelper(
 			ctx,
 			pods,
 			testHelper("helper", "node-a", "vg-a", ""),
@@ -254,6 +295,52 @@ func TestRunHelper(t *testing.T) {
 		}
 	})
 
+	t.Run("success returns the termination message", func(t *testing.T) {
+		pods := &fakePods{podStatus: v1.PodStatus{
+			Phase: v1.PodSucceeded,
+			ContainerStatuses: []v1.ContainerStatus{{
+				Name: "provisioner",
+				State: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{
+					Message: "1002438656",
+				}},
+			}},
+		}}
+
+		message, err := runHelper(
+			context.Background(),
+			pods,
+			testHelper("helper", "node-a", "vg-a", ""),
+			testRunParams("volume", actionTypeCreate),
+		)
+		if err != nil || message != "1002438656" {
+			t.Fatalf("expected termination message, got message=%q err=%v", message, err)
+		}
+	})
+
+	t.Run("out of range exit code maps to out of range", func(t *testing.T) {
+		pods := &fakePods{podStatus: v1.PodStatus{
+			Phase: v1.PodFailed,
+			ContainerStatuses: []v1.ContainerStatus{{
+				Name: "provisioner",
+				State: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{
+					ExitCode: HelperExitCodeOutOfRange,
+					Reason:   "Error",
+					Message:  "allocated size 1002438656 exceeds limit bytes 1000000512",
+				}},
+			}},
+		}}
+
+		_, err := runHelper(
+			context.Background(),
+			pods,
+			testHelper("helper", "node-a", "vg-a", ""),
+			testRunParams("volume", actionTypeCreate),
+		)
+		if status.Code(err) != codes.OutOfRange {
+			t.Fatalf("expected OutOfRange, got %v", err)
+		}
+	})
+
 	t.Run("canceled request retains pending pod for retry", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		pods := &fakePods{
@@ -261,7 +348,7 @@ func TestRunHelper(t *testing.T) {
 			onGet: cancel,
 		}
 
-		err := runHelper(
+		_, err := runHelper(
 			ctx,
 			pods,
 			testHelper("helper", "node-a", "vg-a", ""),
@@ -279,7 +366,7 @@ func TestRunHelper(t *testing.T) {
 			"helper",
 		)
 		pods.phase = v1.PodSucceeded
-		if err := runHelper(
+		if _, err := runHelper(
 			context.Background(),
 			pods,
 			testHelper("helper", "node-a", "vg-a", ""),
@@ -306,7 +393,7 @@ func TestRunHelper(t *testing.T) {
 				}},
 			}},
 		}}
-		err := runHelper(
+		_, err := runHelper(
 			context.Background(),
 			pods,
 			testHelper("helper", "node-a", "vg-a", ""),
@@ -347,7 +434,7 @@ func TestRunHelper(t *testing.T) {
 			existingPod: existing,
 			phase:       v1.PodSucceeded,
 		}
-		if err := runHelper(
+		if _, err := runHelper(
 			context.Background(),
 			pods,
 			desired,
@@ -430,7 +517,7 @@ func TestRunHelper(t *testing.T) {
 
 	t.Run("create failure does not attempt cleanup", func(t *testing.T) {
 		pods := &fakePods{createErr: errors.New("api unavailable")}
-		if err := runHelper(
+		if _, err := runHelper(
 			context.Background(),
 			pods,
 			testHelper("helper", "node-a", "vg-a", ""),
@@ -461,7 +548,7 @@ func TestWaitForHelperPastOldLimit(t *testing.T) {
 		phases:      phases,
 	}
 
-	terminal, err := waitForHelper(
+	terminal, _, err := waitForHelper(
 		context.Background(),
 		pods,
 		"helper",
@@ -474,7 +561,7 @@ func TestWaitForHelperPastOldLimit(t *testing.T) {
 }
 
 func TestWaitForMissingHelperFailsFast(t *testing.T) {
-	terminal, err := waitForHelper(
+	terminal, _, err := waitForHelper(
 		context.Background(),
 		&fakePods{},
 		"missing-helper",
@@ -614,5 +701,34 @@ func podsWithHelper(existing *v1.Pod) *fakePods {
 			"helper",
 		),
 		existingPod: existing,
+	}
+}
+
+func TestVolumeSizeFromHelper(t *testing.T) {
+	tests := []struct {
+		name     string
+		message  string
+		want     int64
+		wantCode codes.Code
+	}{
+		{name: "reported size", message: "1002438656\n", want: 1002438656},
+		{name: "older helper without a size", message: "", want: 1000000512},
+		{name: "invalid size", message: "lv created", wantCode: codes.Internal},
+		{name: "size below the request", message: "4194304", wantCode: codes.Internal},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := volumeSizeFromHelper(tt.message, 1000000512)
+			if tt.wantCode != codes.OK {
+				if status.Code(err) != tt.wantCode {
+					t.Fatalf("expected %v, got size=%d err=%v", tt.wantCode, got, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("expected %d, got size=%d err=%v", tt.want, got, err)
+			}
+		})
 	}
 }

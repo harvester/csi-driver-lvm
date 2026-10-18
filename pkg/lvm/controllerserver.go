@@ -121,7 +121,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	requiredBytes, err := validateCapacityRange(req.GetCapacityRange())
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, capacityError(err)
 	}
 
 	volumeContext := buildVolumeContext(req.GetParameters(), requiredBytes)
@@ -132,14 +132,15 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	klog.Infof("creating volume %s on node: %s", req.GetName(), node)
 
-	if err := cs.provisionVolume(ctx, req, node, lvmType, vgName, requiredBytes); err != nil {
+	capacity, err := cs.provisionVolume(ctx, req, node, lvmType, vgName, requiredBytes)
+	if err != nil {
 		return nil, err
 	}
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:           req.GetName(),
-			CapacityBytes:      requiredBytes,
+			CapacityBytes:      capacity,
 			VolumeContext:      volumeContext,
 			ContentSource:      req.GetVolumeContentSource(),
 			AccessibleTopology: topology,
@@ -152,18 +153,32 @@ func (cs *controllerServer) provisionVolume(
 	req *csi.CreateVolumeRequest,
 	node, lvmType, vgName string,
 	requiredBytes int64,
-) error {
+) (int64, error) {
+	action, err := cs.provisionAction(ctx, req, node, lvmType, vgName, requiredBytes)
+	if err != nil {
+		return 0, err
+	}
+	action.limit = req.GetCapacityRange().GetLimitBytes()
+
+	message, err := createVolumeHelper(ctx, action)
+	if err != nil {
+		klog.Errorf("error creating provisioner pod: %v", err)
+		return 0, err
+	}
+	return volumeSizeFromHelper(message, requiredBytes)
+}
+
+func (cs *controllerServer) provisionAction(
+	ctx context.Context,
+	req *csi.CreateVolumeRequest,
+	node, lvmType, vgName string,
+	requiredBytes int64,
+) (volumeAction, error) {
 	if source := req.GetVolumeContentSource(); source != nil {
 		klog.Infof("cloning volume with source: %v", source)
 		return cs.cloneFromContentSource(ctx, source, req.GetName(), node, lvmType, vgName, requiredBytes)
 	}
-
-	action := cs.newCreateVolumeAction(req.GetName(), node, lvmType, vgName, requiredBytes)
-	if err := createVolumeHelper(ctx, action); err != nil {
-		klog.Errorf("error creating provisioner pod: %v", err)
-		return err
-	}
-	return nil
+	return cs.newCreateVolumeAction(req.GetName(), node, lvmType, vgName, requiredBytes), nil
 }
 
 func (cs *controllerServer) cloneFromContentSource(
@@ -171,9 +186,9 @@ func (cs *controllerServer) cloneFromContentSource(
 	source *csi.VolumeContentSource,
 	dstName, dstNode, dstLVMType, dstVGName string,
 	dstSize int64,
-) error {
+) (volumeAction, error) {
 	if source == nil {
-		return status.Error(codes.InvalidArgument, "volume content source is nil")
+		return volumeAction{}, status.Error(codes.InvalidArgument, "volume content source is nil")
 	}
 	switch source.Type.(type) {
 	case *csi.VolumeContentSource_Snapshot:
@@ -181,7 +196,7 @@ func (cs *controllerServer) cloneFromContentSource(
 	case *csi.VolumeContentSource_Volume:
 		return cs.cloneFromVolumeSource(ctx, source.GetVolume(), dstName, dstNode, dstLVMType, dstVGName, dstSize)
 	default:
-		return status.Errorf(codes.InvalidArgument, "%v not a proper volume source", source)
+		return volumeAction{}, status.Errorf(codes.InvalidArgument, "%v not a proper volume source", source)
 	}
 }
 
@@ -190,20 +205,20 @@ func (cs *controllerServer) cloneFromSnapshotSource(
 	source *csi.VolumeContentSource_SnapshotSource,
 	dstName, dstNode, dstLVMType, dstVGName string,
 	dstSize int64,
-) error {
+) (volumeAction, error) {
 	snapshotID := source.GetSnapshotId()
 	if snapshotID == "" {
-		return status.Error(codes.InvalidArgument, "source snapshot ID is empty")
+		return volumeAction{}, status.Error(codes.InvalidArgument, "source snapshot ID is empty")
 	}
 
 	// Snapshot handles are not VolumeSnapshotContent object names. In particular,
 	// data movers create pre-provisioned contents with their own object names.
 	content, err := cs.getSnapshotContent(ctx, snapshotID)
 	if err != nil {
-		return err
+		return volumeAction{}, err
 	}
 	if content == nil {
-		return status.Errorf(codes.NotFound, "source snapshot %q not found", snapshotID)
+		return volumeAction{}, status.Errorf(codes.NotFound, "source snapshot %q not found", snapshotID)
 	}
 	return cs.cloneFromSnapshot(ctx, content, dstName, dstNode, dstLVMType, dstVGName, dstSize)
 }
@@ -213,18 +228,18 @@ func (cs *controllerServer) cloneFromVolumeSource(
 	source *csi.VolumeContentSource_VolumeSource,
 	dstName, dstNode, dstLVMType, dstVGName string,
 	dstSize int64,
-) error {
+) (volumeAction, error) {
 	volumeID := source.GetVolumeId()
 	if volumeID == "" {
-		return status.Error(codes.InvalidArgument, "source volume ID is empty")
+		return volumeAction{}, status.Error(codes.InvalidArgument, "source volume ID is empty")
 	}
 
 	volume, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
 	if k8serror.IsNotFound(err) {
-		return status.Errorf(codes.NotFound, "source volume %q not found", volumeID)
+		return volumeAction{}, status.Errorf(codes.NotFound, "source volume %q not found", volumeID)
 	}
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "failed to get source volume %q: %v", volumeID, err)
+		return volumeAction{}, status.Errorf(codes.Unavailable, "failed to get source volume %q: %v", volumeID, err)
 	}
 	return cs.cloneFromVolume(ctx, volume, dstName, dstNode, dstLVMType, dstVGName, dstSize)
 }
@@ -305,12 +320,12 @@ func (cs *controllerServer) cloneFromSnapshot(
 	snapContent *snapv1.VolumeSnapshotContent,
 	dstName, dstNode, dstLVType, dstVGName string,
 	dstSize int64,
-) error {
+) (volumeAction, error) {
 	if snapContent == nil {
-		return status.Error(codes.FailedPrecondition, "snapshot content is nil")
+		return volumeAction{}, status.Error(codes.FailedPrecondition, "snapshot content is nil")
 	}
 	if snapContent.Spec.Source.VolumeHandle == nil {
-		return cs.cloneFromPreProvisionedSnapshot(ctx, snapContent, dstName, dstNode, dstLVType, dstVGName, dstSize)
+		return cs.preProvisionedSnapshotCloneAction(ctx, snapContent, dstName, dstNode, dstLVType, dstVGName, dstSize)
 	}
 	return cs.cloneFromDynamicSnapshot(ctx, snapContent, dstName, dstNode, dstLVType, dstVGName, dstSize)
 }
@@ -320,57 +335,22 @@ func (cs *controllerServer) cloneFromDynamicSnapshot(
 	snapContent *snapv1.VolumeSnapshotContent,
 	dstName, dstNode, dstLVType, dstVGName string,
 	dstSize int64,
-) error {
+) (volumeAction, error) {
 	sourceVolumeID, snapshotID, restoreSize, err := metadataFromSnapshotContent(snapContent)
 	if err != nil {
-		return status.Error(codes.FailedPrecondition, err.Error())
+		return volumeAction{}, status.Error(codes.FailedPrecondition, err.Error())
 	}
 
 	srcVol, err := cs.kubeClient.CoreV1().PersistentVolumes().Get(ctx, sourceVolumeID, metav1.GetOptions{})
 	if k8serror.IsNotFound(err) {
-		return status.Errorf(codes.NotFound, "source volume %q not found", sourceVolumeID)
+		return volumeAction{}, status.Errorf(codes.NotFound, "source volume %q not found", sourceVolumeID)
 	}
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "failed to get source volume %q: %v", sourceVolumeID, err)
+		return volumeAction{}, status.Errorf(codes.Unavailable, "failed to get source volume %q: %v", sourceVolumeID, err)
 	}
 
 	snapshotLVName := fmt.Sprintf("lvm-%s", snapshotID)
-	va, err := cs.generateVolumeActionForClone(srcVol, snapshotLVName, dstName, dstNode, dstLVType, dstVGName, restoreSize, dstSize)
-	if err != nil {
-		return err
-	}
-
-	if err := createVolumeHelper(ctx, va); err != nil {
-		klog.Errorf("error creating provisioner pod :%v", err)
-		return err
-	}
-
-	return nil
-}
-
-func (cs *controllerServer) cloneFromPreProvisionedSnapshot(
-	ctx context.Context,
-	snapContent *snapv1.VolumeSnapshotContent,
-	dstName, dstNode, dstLVType, dstVGName string,
-	dstSize int64,
-) error {
-	action, err := cs.preProvisionedSnapshotCloneAction(
-		ctx,
-		snapContent,
-		dstName,
-		dstNode,
-		dstLVType,
-		dstVGName,
-		dstSize,
-	)
-	if err != nil {
-		return err
-	}
-	if err := createVolumeHelper(ctx, action); err != nil {
-		klog.Errorf("error creating provisioner pod: %v", err)
-		return err
-	}
-	return nil
+	return cs.generateVolumeActionForClone(srcVol, snapshotLVName, dstName, dstNode, dstLVType, dstVGName, restoreSize, dstSize)
 }
 
 func (cs *controllerServer) preProvisionedSnapshotCloneAction(
@@ -408,23 +388,13 @@ func (cs *controllerServer) cloneFromVolume(
 	srcVol *v1.PersistentVolume,
 	dstName, dstNode, dstLVType, dstVGName string,
 	dstSize int64,
-) error {
+) (volumeAction, error) {
 	srcSize, err := requiredBytesFromPersistentVolume(srcVol)
 	if err != nil {
-		return status.Error(codes.FailedPrecondition, err.Error())
+		return volumeAction{}, status.Error(codes.FailedPrecondition, err.Error())
 	}
 	srcLVName := srcVol.GetName()
-	va, err := cs.generateVolumeActionForClone(srcVol, srcLVName, dstName, dstNode, dstLVType, dstVGName, srcSize, dstSize)
-	if err != nil {
-		return err
-	}
-
-	if err := createVolumeHelper(ctx, va); err != nil {
-		klog.Errorf("error creating provisioner pod :%v", err)
-		return err
-	}
-
-	return nil
+	return cs.generateVolumeActionForClone(srcVol, srcLVName, dstName, dstNode, dstLVType, dstVGName, srcSize, dstSize)
 }
 
 func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
@@ -462,7 +432,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 
 	va := cs.newDeleteVolumeAction(volID, nodeName, vgName, lvmType)
-	if err := createVolumeHelper(ctx, va); err != nil {
+	if _, err := createVolumeHelper(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
 		return nil, err
 	}

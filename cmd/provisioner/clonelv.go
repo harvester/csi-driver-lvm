@@ -44,10 +44,11 @@ func cloneLVCmd() *cli.Command {
 				Name:  flagLVSize,
 				Usage: "Required. The size of the lv in MiB",
 			},
+			lvLimitFlag(),
 		},
 		Action: func(c *cli.Context) error {
 			if err := clonelv(c); err != nil {
-				klog.Fatalf("Error creating lv: %v", err)
+				exitWithError("Error creating lv", err)
 				return err
 			}
 			return nil
@@ -84,6 +85,7 @@ func clonelv(c *cli.Context) error {
 	if dstSize == 0 {
 		return fmt.Errorf("invalid empty flag %v", flagLVSize)
 	}
+	dstLimit := c.Uint64(flagLVLimit)
 
 	klog.Infof("Clone from src: %s, to dst: %s/%s", srcLvName, dstVGName, dstLV)
 
@@ -93,13 +95,20 @@ func clonelv(c *cli.Context) error {
 
 	klog.Infof("clone lv %s, vg: %s, type: %s", srcLvName, srcVgName, srcType)
 	if strings.HasPrefix(srcLvName, snapshotPrefix) && srcType == lvm.DmThinType && srcType == dstLVType && srcVgName == dstVGName {
-		// special case for clone dm-thin, so activate the target
+		// special case for clone dm-thin, so activate the target. The
+		// snapshot has the size of its origin, so grow it to the requested size.
+		if err := lvm.CheckThinCloneSize(srcVgName, srcLvName, dstSize, dstLimit); err != nil {
+			return err
+		}
 		_, err := lvm.CreateSnapshot(dstLV, srcLvName, srcVgName, int64(dstSize), dstLVType, createSnapshotForClone) //nolint:gosec
 		if err != nil {
 			return fmt.Errorf("unable to create snapshot: %w", err)
 		}
+		if output, err := lvm.ExtendLogicalVolume(dstVGName, dstLV, dstSize, dstLimit); err != nil {
+			return fmt.Errorf("unable to extend cloned lv: %w output:%s", err, output)
+		}
 		klog.Infof("lv: %s/%s cloned from %s", dstVGName, dstLV, srcLvName)
-		return nil
+		return reportVolumeSize(dstVGName, dstLV)
 	}
 
 	// check source dev
@@ -110,7 +119,7 @@ func clonelv(c *cli.Context) error {
 	}
 	defer src.Close()
 
-	output, err := lvm.CreateLVS(dstVGName, dstLV, dstSize, dstLVType)
+	output, err := lvm.CreateLVS(dstVGName, dstLV, dstSize, dstLimit, dstLVType)
 	if err != nil {
 		return fmt.Errorf("unable to create lv: %w output:%s", err, output)
 	}
@@ -132,7 +141,7 @@ func clonelv(c *cli.Context) error {
 
 	klog.Infof("lv: %s/%s cloned from %s", dstVGName, dstLV, srcDev)
 
-	return nil
+	return reportVolumeSize(dstVGName, dstLV)
 }
 
 func ensureCloneVolumeGroups(srcVGName, dstVGName string) error {
