@@ -662,12 +662,14 @@ func CreateLVS(vg string, name string, size, limit uint64, lvmType string) (stri
 		if err := validateExistingVolume(existing, size, lvmType); err != nil {
 			return "", err
 		}
-		actualSize, err := parseLogicalVolumeSize(existing)
-		if err != nil {
-			return "", err
-		}
-		if err := checkSizeLimit(actualSize, limit); err != nil {
-			return "", err
+		if lvmType == DmThinType {
+			actualSize, err := parseLogicalVolumeSize(existing)
+			if err != nil {
+				return "", err
+			}
+			if err := checkSizeLimit(actualSize, limit); err != nil {
+				return "", err
+			}
 		}
 		klog.Infof("logical volume %s/%s already exists and is compatible", vg, name)
 		return name, nil
@@ -678,29 +680,31 @@ func CreateLVS(vg string, name string, size, limit uint64, lvmType string) (stri
 		return "", err
 	}
 
-	pvs, extentSize, err := vgGeometry(vg)
+	executor := newCommandExecutor()
+	args := []string{"-v", "--yes", "-n", name, "-W", "y"}
+
+	pvs, err := pvCount(vg)
 	if err != nil {
-		return "", fmt.Errorf("unable to determine geometry of vg: %w", err)
+		return "", fmt.Errorf("unable to determine pv count of vg: %w", err)
 	}
 
 	if pvs < 2 && lvmType == StripedType {
 		klog.Warning("pvcount is <2, the striped does not meaningful.")
 	}
 
-	stripes := 1
-	if lvmType == StripedType {
-		stripes = pvs
+	if lvmType == DmThinType {
+		extentSize, err := vgExtentSize(executor, vg)
+		if err != nil {
+			return "", err
+		}
+		allocated, err := allocatedSize(size, extentSize)
+		if err != nil {
+			return "", err
+		}
+		if err := checkSizeLimit(allocated, limit); err != nil {
+			return "", err
+		}
 	}
-	allocated, err := allocatedSize(size, extentSize, stripes)
-	if err != nil {
-		return "", err
-	}
-	if err := checkSizeLimit(allocated, limit); err != nil {
-		return "", err
-	}
-
-	executor := newCommandExecutor()
-	args := []string{"-v", "--yes", "-n", name, "-W", "y"}
 
 	switch lvmType {
 	case StripedType:
@@ -983,27 +987,20 @@ func LogicalVolumeSize(vgName, lvName string) (uint64, error) {
 	return parseLogicalVolumeSize(volume)
 }
 
-// lvcreate and lvextend round up to whole extents, and striped volumes up to a
-// full stripe. The result fits in an int64, the CSI capacity type.
-func allocatedSize(size, extentSize uint64, stripes int) (uint64, error) {
+// lvcreate and lvextend round dm-thin volumes up to whole extents. The result
+// fits in an int64, the CSI capacity type.
+func allocatedSize(size, extentSize uint64) (uint64, error) {
 	if extentSize == 0 {
 		return 0, fmt.Errorf("invalid extent size 0")
 	}
-	if stripes < 1 {
-		stripes = 1
+	extents := size / extentSize
+	if size%extentSize != 0 {
+		extents++
 	}
-	if extentSize > math.MaxInt64/uint64(stripes) {
-		return 0, fmt.Errorf("%w: stripe of %d extents of %d bytes is too large", ErrOutOfRange, stripes, extentSize)
+	if extents > math.MaxInt64/extentSize {
+		return 0, fmt.Errorf("%w: size %d overflows when rounded up to %d bytes", ErrOutOfRange, size, extentSize)
 	}
-	unit := extentSize * uint64(stripes)
-	units := size / unit
-	if size%unit != 0 {
-		units++
-	}
-	if units > math.MaxInt64/unit {
-		return 0, fmt.Errorf("%w: size %d overflows when rounded up to %d bytes", ErrOutOfRange, size, unit)
-	}
-	return units * unit, nil
+	return extents * extentSize, nil
 }
 
 func checkSizeLimit(size, limit uint64) error {
@@ -1037,12 +1034,14 @@ func ensureLogicalVolumeSize(executor commandExecutor, volume logicalVolume, siz
 	if err != nil {
 		return 0, "", err
 	}
-	planned, err := plannedSize(executor, volume, lvSize, size)
-	if err != nil {
-		return 0, "", err
-	}
-	if err := checkSizeLimit(planned, limit); err != nil {
-		return 0, "", err
+	if volume.SegType == ThinVolType {
+		planned, err := plannedSize(executor, volume, lvSize, size)
+		if err != nil {
+			return 0, "", err
+		}
+		if err := checkSizeLimit(planned, limit); err != nil {
+			return 0, "", err
+		}
 	}
 	if lvSize >= size {
 		klog.Infof("logical volume %s already has size %d, satisfying requested size %d", volume.Name, lvSize, size)
@@ -1062,17 +1061,16 @@ func ensureLogicalVolumeSize(executor commandExecutor, volume logicalVolume, siz
 	return newSize, output, nil
 }
 
-// lvextend rounds the growth up to whole extents, and to a full stripe of the
-// last segment for striped volumes.
+// lvextend rounds the growth of a dm-thin volume up to whole extents.
 func plannedSize(executor commandExecutor, volume logicalVolume, lvSize, size uint64) (uint64, error) {
 	if lvSize >= size {
 		return lvSize, nil
 	}
-	stripes, extentSize, err := lastSegmentGeometry(executor, volume.VGName, volume.Name)
+	extentSize, err := vgExtentSize(executor, volume.VGName)
 	if err != nil {
 		return 0, err
 	}
-	growth, err := allocatedSize(size-lvSize, extentSize, stripes)
+	growth, err := allocatedSize(size-lvSize, extentSize)
 	if err != nil {
 		return 0, err
 	}
@@ -1109,33 +1107,16 @@ func ExtendLogicalVolume(vgName, lvName string, size, limit uint64) (string, err
 	return output, err
 }
 
-func lastSegmentGeometry(executor commandExecutor, vgName, lvName string) (int, uint64, error) {
-	args := []string{
-		"--segments",
-		"--noheadings",
-		"--units", "b",
-		"--nosuffix",
-		"--options", "stripes,vg_extent_size",
-		fmt.Sprintf("%s/%s", vgName, lvName),
-	}
-	out, err := executor.Execute("lvs", args)
+func vgExtentSize(executor commandExecutor, vgName string) (uint64, error) {
+	out, err := executor.Execute("vgs", []string{vgName, "--noheadings", "--units", "b", "--nosuffix", "-o", "vg_extent_size"})
 	if err != nil {
-		return 0, 0, fmt.Errorf("unable to get segments of logical volume %q/%q: %w", vgName, lvName, err)
+		return 0, fmt.Errorf("unable to get extent size of vg %q: %w", vgName, err)
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	fields := strings.Fields(lines[len(lines)-1])
-	if len(fields) != 2 {
-		return 0, 0, fmt.Errorf("unable to parse segments of logical volume %q/%q: %q", vgName, lvName, out)
-	}
-	stripes, err := strconv.Atoi(fields[0])
+	extentSize, err := strconv.ParseUint(strings.TrimSpace(out), 10, 64)
 	if err != nil {
-		return 0, 0, fmt.Errorf("unable to parse stripes %q of logical volume %q/%q: %w", fields[0], vgName, lvName, err)
+		return 0, fmt.Errorf("unable to parse extent size %q of vg %q: %w", strings.TrimSpace(out), vgName, err)
 	}
-	extentSize, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("unable to parse extent size %q of logical volume %q/%q: %w", fields[1], vgName, lvName, err)
-	}
-	return stripes, extentSize, nil
+	return extentSize, nil
 }
 
 func resizeFilesystem(executor commandExecutor, volume logicalVolume, volumePath string) (string, error) {
@@ -1314,25 +1295,18 @@ func RemoveThinPool(vgName string) error {
 	return nil
 }
 
-func vgGeometry(vgname string) (int, uint64, error) {
+func pvCount(vgname string) (int, error) {
 	executor := newCommandExecutor()
-	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "--units", "b", "--nosuffix", "-o", "pv_count,vg_extent_size"})
+	out, err := executor.Execute("vgs", []string{vgname, "--noheadings", "-o", "pv_count"})
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	fields := strings.Fields(out)
-	if len(fields) != 2 {
-		return 0, 0, fmt.Errorf("unable to parse vgs output %q", out)
-	}
-	count, err := strconv.Atoi(fields[0])
+	outStr := strings.TrimSpace(out)
+	count, err := strconv.Atoi(outStr)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	extentSize, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	return count, extentSize, nil
+	return count, nil
 }
 
 func getThinPoolAndCounts(vgName string) (map[string]int, error) {
