@@ -1,13 +1,17 @@
 package lvm
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strconv"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -46,11 +50,42 @@ func parseLVMParameters(parameters map[string]string) (string, string, error) {
 	return lvmType, vgName, nil
 }
 
+// lvSizeAlignment is the granularity lvcreate and lvextend accept for byte sizes.
+const lvSizeAlignment = 512
+
+// ErrOutOfRange reports a capacity range the volume cannot satisfy.
+var ErrOutOfRange = errors.New("capacity out of range")
+
+// CDI computes sizes with a filesystem overhead, so requests are often not aligned
+// and lvcreate rejects them with "Size is not a multiple of 512". The size after
+// extent rounding is checked on the node, where the volume group is known.
 func validateCapacityRange(capacityRange *csi.CapacityRange) (int64, error) {
 	if capacityRange == nil || capacityRange.GetRequiredBytes() <= 0 {
 		return 0, fmt.Errorf("capacity range with required bytes greater than zero is required")
 	}
-	return capacityRange.GetRequiredBytes(), nil
+	required := capacityRange.GetRequiredBytes()
+	limit := capacityRange.GetLimitBytes()
+	if limit < 0 {
+		return 0, fmt.Errorf("limit bytes %d must not be negative", limit)
+	}
+	if limit > 0 && required > limit {
+		return 0, fmt.Errorf("required bytes %d exceed limit bytes %d", required, limit)
+	}
+	if required > math.MaxInt64-(lvSizeAlignment-1) {
+		return 0, fmt.Errorf("%w: required bytes %d overflow when rounded up to %d bytes", ErrOutOfRange, required, lvSizeAlignment)
+	}
+	size := (required + lvSizeAlignment - 1) / lvSizeAlignment * lvSizeAlignment
+	if limit > 0 && size > limit {
+		return 0, fmt.Errorf("%w: required bytes %d rounded up to %d exceed limit bytes %d", ErrOutOfRange, required, size, limit)
+	}
+	return size, nil
+}
+
+func capacityError(err error) error {
+	if errors.Is(err, ErrOutOfRange) {
+		return status.Error(codes.OutOfRange, err.Error())
+	}
+	return status.Error(codes.InvalidArgument, err.Error())
 }
 
 func validateCreateSnapshotRequest(req *csi.CreateSnapshotRequest) (string, string, error) {

@@ -3,6 +3,7 @@ package lvm
 import (
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -297,7 +298,7 @@ func TestCreateLVSExistingVolumeCompatibility(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		if _, err := CreateLVS("vg", "volume", 1048576, DmThinType); err != nil {
+		if _, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType); err != nil {
 			t.Fatalf("compatible retry failed: %v", err)
 		}
 		if len(fake.calls) != 1 {
@@ -312,7 +313,7 @@ func TestCreateLVSExistingVolumeCompatibility(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		if _, err := CreateLVS("vg", "volume", 1048576, StripedType); err == nil {
+		if _, err := CreateLVS("vg", "volume", 1048576, 0, StripedType); err == nil {
 			t.Fatal("expected incompatible type error")
 		}
 	})
@@ -343,7 +344,7 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		_, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err == nil || !strings.Contains(err.Error(), `thin pool "vg"/"vg-thinpool" is inactive`) {
 			t.Fatalf("expected inactive thin-pool error, got %v", err)
 		}
@@ -363,7 +364,7 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		_, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err == nil || !strings.Contains(err.Error(), `thin pool "vg"/"vg-thinpool" is unhealthy: "partial"`) {
 			t.Fatalf("expected unhealthy thin-pool error, got %v", err)
 		}
@@ -380,12 +381,13 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 				{command: "lvs", output: thinPool},
 				{command: "lvs", output: "twi-a-tz--"},
 				{command: "vgs", output: "1"},
+				{command: "vgs", output: "  4194304\n"},
 				{command: "lvcreate", output: "created"},
 			},
 		}
 		useFakeCommandExecutor(t, fake)
 
-		output, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		output, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err != nil || output != "created" {
 			t.Fatalf("expected active healthy pool to permit creation, output=%q err=%v", output, err)
 		}
@@ -409,12 +411,13 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 				{command: "lvs", output: noVolumes},
 				{command: "lvcreate", output: "pool created"},
 				{command: "vgs", output: "1"},
+				{command: "vgs", output: "  4194304\n"},
 				{command: "lvcreate", output: "volume created"},
 			},
 		}
 		useFakeCommandExecutor(t, fake)
 
-		output, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		output, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err != nil || output != "volume created" {
 			t.Fatalf("expected thin pool and volume creation, output=%q err=%v", output, err)
 		}
@@ -456,7 +459,7 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		_, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err == nil || !strings.Contains(err.Error(), `thin pool "vg"/"vg-thinpool" is incomplete`) {
 			t.Fatalf("expected incomplete thin-pool error, got %v", err)
 		}
@@ -489,7 +492,7 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		_, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err == nil || !errors.Is(err, cmd.ErrCmdTimeout) {
 			t.Fatalf("expected thin-pool creation timeout, got %v", err)
 		}
@@ -513,7 +516,7 @@ func TestCreateLVSValidatesExistingThinPool(t *testing.T) {
 		}
 		useFakeCommandExecutor(t, fake)
 
-		_, err := CreateLVS("vg", "volume", 1048576, DmThinType)
+		_, err := CreateLVS("vg", "volume", 1048576, 0, DmThinType)
 		if err == nil || !errors.Is(err, cmd.ErrCmdTimeout) {
 			t.Fatalf("expected thin-pool creation timeout, got %v", err)
 		}
@@ -714,17 +717,21 @@ func TestExtendLVSExpandsLogicalVolumeAndExt4Filesystem(t *testing.T) {
 				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"1048576","segtype":"linear","origin":""}]}]}`,
 			},
 			{command: "lvextend", output: "extended"},
+			{
+				command: "lvs",
+				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"2097152","segtype":"linear","origin":""}]}]}`,
+			},
 			{command: "blkid", output: "ext4\n"},
 			{command: "resize2fs", output: "resized"},
 		},
 	}
 	useFakeCommandExecutor(t, fake)
 
-	out, err := extendLVS("volume", 2097152, false, "/mnt/volume")
-	if err != nil || out != "extended\nresized" {
-		t.Fatalf("extendLVS failed: output=%q err=%v", out, err)
+	size, out, err := extendLVS("volume", 2097152, 0, false, "/mnt/volume")
+	if err != nil || out != "extended\nresized" || size != 2097152 {
+		t.Fatalf("extendLVS failed: size=%d output=%q err=%v", size, out, err)
 	}
-	wantCommands := []string{"lvs", "lvextend", "blkid", "resize2fs"}
+	wantCommands := []string{"lvs", "lvextend", "lvs", "blkid", "resize2fs"}
 	if len(fake.calls) != len(wantCommands) {
 		t.Fatalf("unexpected command sequence: %#v", fake.calls)
 	}
@@ -752,7 +759,7 @@ func TestExtendLVSRetriesExt4ResizeWhenLogicalVolumeAlreadyExpanded(t *testing.T
 	}
 	useFakeCommandExecutor(t, fake)
 
-	out, err := extendLVS("volume", 2097152, false, "/mnt/volume")
+	_, out, err := extendLVS("volume", 2097152, 0, false, "/mnt/volume")
 	if err != nil || out != "filesystem expanded" {
 		t.Fatalf("extendLVS retry failed: output=%q err=%v", out, err)
 	}
@@ -775,16 +782,21 @@ func TestExtendLVSExpandsBlockVolumeWithoutFilesystemCommands(t *testing.T) {
 				command: "lvs",
 				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"1048576","segtype":"thin","origin":""}]}]}`,
 			},
+			{command: "vgs", output: "  1048576\n"},
 			{command: "lvextend", output: "extended"},
+			{
+				command: "lvs",
+				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"2097152","segtype":"thin","origin":""}]}]}`,
+			},
 		},
 	}
 	useFakeCommandExecutor(t, fake)
 
-	out, err := extendLVS("volume", 2097152, true, "/unused")
+	_, out, err := extendLVS("volume", 2097152, 0, true, "/unused")
 	if err != nil || out != "extended" {
 		t.Fatalf("block extendLVS failed: output=%q err=%v", out, err)
 	}
-	if len(fake.calls) != 2 || fake.calls[1].command != "lvextend" {
+	if len(fake.calls) != 4 || fake.calls[2].command != "lvextend" {
 		t.Fatalf("unexpected block-volume command sequence: %#v", fake.calls)
 	}
 }
@@ -804,7 +816,7 @@ func TestExtendLVSUsesMountPathForXFS(t *testing.T) {
 	useFakeCommandExecutor(t, fake)
 
 	const mountPath = "/mnt/xfs-volume"
-	if _, err := extendLVS("volume", 2097152, false, mountPath); err != nil {
+	if _, _, err := extendLVS("volume", 2097152, 0, false, mountPath); err != nil {
 		t.Fatalf("XFS extendLVS failed: %v", err)
 	}
 	want := []string{"-d", mountPath}
@@ -822,13 +834,17 @@ func TestExtendLVSReturnsFilesystemResizeFailureAfterLVExpansion(t *testing.T) {
 				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"1048576","segtype":"linear","origin":""}]}]}`,
 			},
 			{command: "lvextend", output: "LV expanded"},
+			{
+				command: "lvs",
+				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"2097152","segtype":"linear","origin":""}]}]}`,
+			},
 			{command: "blkid", output: "ext4"},
 			{command: "resize2fs", output: "resize output", err: errors.New("resize failed")},
 		},
 	}
 	useFakeCommandExecutor(t, fake)
 
-	out, err := extendLVS("volume", 2097152, false, "/mnt/volume")
+	_, out, err := extendLVS("volume", 2097152, 0, false, "/mnt/volume")
 	if err == nil || !strings.Contains(err.Error(), `unable to resize "ext4" filesystem`) {
 		t.Fatalf("expected filesystem resize failure, got output=%q err=%v", out, err)
 	}
@@ -850,7 +866,7 @@ func TestExtendLVSRejectsUnsupportedFilesystem(t *testing.T) {
 	}
 	useFakeCommandExecutor(t, fake)
 
-	if _, err := extendLVS("volume", 2097152, false, "/mnt/volume"); err == nil || !strings.Contains(err.Error(), "does not support expansion") {
+	if _, _, err := extendLVS("volume", 2097152, 0, false, "/mnt/volume"); err == nil || !strings.Contains(err.Error(), "does not support expansion") {
 		t.Fatalf("expected unsupported filesystem error, got %v", err)
 	}
 }
@@ -988,5 +1004,160 @@ func TestThinPoolCreateArgs(t *testing.T) {
 	got := thinPoolCreateArgs("vg-test", "vg-test-thinpool")
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("thinPoolCreateArgs() = %v, want %v", got, want)
+	}
+}
+
+func TestAllocatedSize(t *testing.T) {
+	const extent = 4194304
+	// Expected sizes match what lvcreate -V allocated on a VG with 4 MiB extents.
+	tests := []struct {
+		name       string
+		size       uint64
+		extentSize uint64
+		want       uint64
+		wantErr    bool
+	}{
+		{name: "rounded up to whole extents", size: 1000000512, extentSize: extent, want: 1002438656},
+		{name: "one sector is one extent", size: 512, extentSize: extent, want: extent},
+		{name: "already a whole extent", size: extent, extentSize: extent, want: extent},
+		{name: "zero extent size", size: 512, extentSize: 0, wantErr: true},
+		{name: "rounding overflows int64", size: math.MaxInt64, extentSize: extent, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := allocatedSize(tt.size, tt.extentSize)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d", got)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("allocatedSize(%d, %d) = %d, %v; want %d", tt.size, tt.extentSize, got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreateLVSChecksAllocatedSizeAgainstLimit(t *testing.T) {
+	const noVolumes = `{"report":[{"lv":[]}]}`
+	const thinPool = `{"report":[{"lv":[{"lv_name":"vg-thinpool","vg_name":"vg","lv_size":"1048576","segtype":"thin-pool","origin":""}]}]}`
+	results := func(extra ...commandResult) []commandResult {
+		return append([]commandResult{
+			{command: "lvs", output: noVolumes},
+			{command: "lvs", output: thinPool},
+			{command: "lvs", output: "twi-a-tz--"},
+			{command: "vgs", output: "1"},
+			{command: "vgs", output: "  4194304\n"},
+		}, extra...)
+	}
+
+	t.Run("size above limit fails before lvcreate", func(t *testing.T) {
+		fake := &fakeCommandExecutor{t: t, results: results()}
+		useFakeCommandExecutor(t, fake)
+
+		_, err := CreateLVS("vg", "volume", 1000000512, 1000000512, DmThinType)
+		if !errors.Is(err, ErrOutOfRange) {
+			t.Fatalf("expected ErrOutOfRange, got %v", err)
+		}
+		if len(fake.calls) != 5 {
+			t.Fatalf("limit check should fail before lvcreate, got %#v", fake.calls)
+		}
+	})
+
+	t.Run("size within limit is created", func(t *testing.T) {
+		fake := &fakeCommandExecutor{t: t, results: results(commandResult{command: "lvcreate", output: "created"})}
+		useFakeCommandExecutor(t, fake)
+
+		if _, err := CreateLVS("vg", "volume", 1000000512, 1002438656, DmThinType); err != nil {
+			t.Fatalf("CreateLVS failed: %v", err)
+		}
+	})
+
+	t.Run("existing volume above limit fails", func(t *testing.T) {
+		fake := &fakeCommandExecutor{
+			t: t,
+			results: []commandResult{{
+				command: "lvs",
+				output:  `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"4194304","segtype":"thin","origin":""}]}]}`,
+			}},
+		}
+		useFakeCommandExecutor(t, fake)
+
+		if _, err := CreateLVS("vg", "volume", 1048576, 1048576, DmThinType); !errors.Is(err, ErrOutOfRange) {
+			t.Fatalf("expected ErrOutOfRange, got %v", err)
+		}
+	})
+}
+
+func TestExtendLVSChecksAllocatedSizeAgainstLimit(t *testing.T) {
+	const thin = `{"report":[{"lv":[{"lv_name":"volume","vg_name":"vg","lv_size":"1002438656","segtype":"thin","origin":""}]}]}`
+
+	t.Run("growth rounded to extents exceeds limit", func(t *testing.T) {
+		fake := &fakeCommandExecutor{
+			t: t,
+			results: []commandResult{
+				{command: "lvs", output: thin},
+				{command: "vgs", output: "  4194304\n"},
+			},
+		}
+		useFakeCommandExecutor(t, fake)
+
+		// lvextend rounds 1100000256 up to whole extents: 1103101952.
+		_, _, err := extendLVS("volume", 1100000256, 1100000256, true, "/unused")
+		if !errors.Is(err, ErrOutOfRange) {
+			t.Fatalf("expected ErrOutOfRange, got %v", err)
+		}
+		if len(fake.calls) != 2 {
+			t.Fatalf("limit check should fail before lvextend, got %#v", fake.calls)
+		}
+	})
+
+	t.Run("returns the size reported after lvextend", func(t *testing.T) {
+		fake := &fakeCommandExecutor{
+			t: t,
+			results: []commandResult{
+				{command: "lvs", output: thin},
+				{command: "vgs", output: "  4194304\n"},
+				{command: "lvextend", output: "extended"},
+				{command: "lvs", output: strings.Replace(thin, "1002438656", "1103101952", 1)},
+			},
+		}
+		useFakeCommandExecutor(t, fake)
+
+		size, _, err := extendLVS("volume", 1100000256, 1103101952, true, "/unused")
+		if err != nil || size != 1103101952 {
+			t.Fatalf("expected size 1103101952, got size=%d err=%v", size, err)
+		}
+	})
+
+	t.Run("existing volume above limit fails", func(t *testing.T) {
+		fake := &fakeCommandExecutor{
+			t:       t,
+			results: []commandResult{{command: "lvs", output: thin}},
+		}
+		useFakeCommandExecutor(t, fake)
+
+		if _, _, err := extendLVS("volume", 4194304, 4194304, true, "/unused"); !errors.Is(err, ErrOutOfRange) {
+			t.Fatalf("expected ErrOutOfRange, got %v", err)
+		}
+	})
+}
+
+func TestCheckThinCloneSizeChecksGrownSize(t *testing.T) {
+	const snapshot = `{"report":[{"lv":[{"lv_name":"lvm-snapshot-a","vg_name":"vg","lv_size":"12582912","segtype":"thin","origin":"volume"}]}]}`
+	fake := &fakeCommandExecutor{
+		t: t,
+		results: []commandResult{
+			{command: "lvs", output: snapshot},
+			{command: "vgs", output: "  4194304\n"},
+		},
+	}
+	useFakeCommandExecutor(t, fake)
+
+	// The clone starts at 12 MiB and grows to 16 MiB, one byte above the limit.
+	if err := CheckThinCloneSize("vg", "lvm-snapshot-a", 16777216, 16777215); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("expected ErrOutOfRange, got %v", err)
 	}
 }

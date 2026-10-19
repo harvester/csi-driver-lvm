@@ -252,7 +252,7 @@ func TestCreateSnapshotDoesNotPanicWhenPVIsAbsent(t *testing.T) {
 
 func TestCloneFromSnapshotRejectsIncompleteContent(t *testing.T) {
 	cs := controllerWithFakeClients()
-	err := cs.cloneFromSnapshot(
+	_, err := cs.cloneFromSnapshot(
 		context.Background(),
 		&snapv1.VolumeSnapshotContent{ObjectMeta: metav1.ObjectMeta{Name: "incomplete"}},
 		"destination",
@@ -268,7 +268,7 @@ func TestCloneFromSnapshotRejectsIncompleteContent(t *testing.T) {
 
 func TestCloneFromVolumeRejectsMalformedPersistentVolume(t *testing.T) {
 	cs := controllerWithFakeClients()
-	err := cs.cloneFromVolume(
+	_, err := cs.cloneFromVolume(
 		context.Background(),
 		&v1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "malformed"}},
 		"destination",
@@ -306,7 +306,7 @@ func TestCloneFromContentSourceRejectsInvalidSources(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := cs.cloneFromContentSource(
+			_, err := cs.cloneFromContentSource(
 				context.Background(),
 				tt.source,
 				"destination",
@@ -577,7 +577,7 @@ func TestCloneFromSnapshotSourceResolvesContentByHandle(t *testing.T) {
 		},
 	}}}
 
-	err := cs.cloneFromContentSource(
+	_, err := cs.cloneFromContentSource(
 		context.Background(),
 		&csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snapshot-id"},
@@ -595,7 +595,7 @@ func TestCloneFromSnapshotSourceResolvesContentByHandle(t *testing.T) {
 
 func TestCloneFromSnapshotSourceReturnsNotFound(t *testing.T) {
 	cs := controllerWithFakeClients()
-	err := cs.cloneFromContentSource(
+	_, err := cs.cloneFromContentSource(
 		context.Background(),
 		&csi.VolumeContentSource{Type: &csi.VolumeContentSource_Snapshot{
 			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "missing"},
@@ -772,7 +772,7 @@ func TestCloneFromDynamicSnapshotRejectsIncompleteStatus(t *testing.T) {
 		},
 	}
 
-	err := cs.cloneFromSnapshot(
+	_, err := cs.cloneFromSnapshot(
 		context.Background(),
 		content,
 		"destination",

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,13 @@ const (
 	helperResourceLabel  = "lvm.driver.harvesterhci.io/resource"
 	helperOperationLabel = "lvm.driver.harvesterhci.io/operation"
 	helperVGAnnotation   = "lvm.driver.harvesterhci.io/volume-group"
+)
+
+const (
+	// HelperTerminationMessagePath is where volume helpers write the LV size.
+	HelperTerminationMessagePath = "/termination.log"
+	// HelperExitCodeOutOfRange is the exit code for ErrOutOfRange.
+	HelperExitCodeOutOfRange = 3
 )
 
 var (
@@ -98,7 +106,7 @@ func createSnapshotHelper(ctx context.Context, action snapshotAction) error {
 	klog.Infof("starting snapshot helper with args: %s", args)
 	params := action.helperParams()
 	pods := action.kubeClient.CoreV1().Pods(action.namespace)
-	if err := runHelper(ctx, pods, newHelperPod(params, args), params); err != nil {
+	if _, err := runHelper(ctx, pods, newHelperPod(params, args), params); err != nil {
 		return err
 	}
 
@@ -140,17 +148,18 @@ func snapshotHelperArgs(action snapshotAction) ([]string, error) {
 	}
 }
 
-func createVolumeHelper(ctx context.Context, action volumeAction) error {
+func createVolumeHelper(ctx context.Context, action volumeAction) (string, error) {
 	args, err := volumeHelperArgs(action)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	klog.Infof("starting volume helper with args: %s", args)
 	params := action.helperParams()
 	pods := action.kubeClient.CoreV1().Pods(action.namespace)
-	if err := runHelper(ctx, pods, newHelperPod(params, args), params); err != nil {
-		return err
+	message, err := runHelper(ctx, pods, newHelperPod(params, args), params)
+	if err != nil {
+		return "", err
 	}
 
 	klog.Infof(
@@ -159,7 +168,24 @@ func createVolumeHelper(ctx context.Context, action volumeAction) error {
 		action.action,
 		action.nodeName,
 	)
-	return nil
+	return message, nil
+}
+
+// Helpers from older provisioner images do not report the size.
+func volumeSizeFromHelper(message string, requested int64) (int64, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		klog.Warningf("volume helper did not report the volume size, using the requested size %d", requested)
+		return requested, nil
+	}
+	size, err := strconv.ParseInt(message, 10, 64)
+	if err != nil || size <= 0 {
+		return 0, status.Errorf(codes.Internal, "volume helper reported an invalid volume size %q", message)
+	}
+	if size < requested {
+		return 0, status.Errorf(codes.Internal, "volume helper reported size %d, smaller than requested size %d", size, requested)
+	}
+	return size, nil
 }
 
 func volumeHelperArgs(action volumeAction) ([]string, error) {
@@ -180,6 +206,7 @@ func volumeHelperArgs(action volumeAction) ([]string, error) {
 			"--vgname", action.vgName,
 			"--lvname", action.name,
 		}
+		args = appendLimitArg(args, action.limit)
 	case actionTypeDelete:
 		if action.srcInfo == nil {
 			return nil, fmt.Errorf("deletelv without source volume information")
@@ -204,10 +231,19 @@ func volumeHelperArgs(action volumeAction) ([]string, error) {
 			"--lvmtype", action.lvmType,
 			"--lvname", action.name,
 		}
+		args = appendLimitArg(args, action.limit)
 	default:
 		return nil, fmt.Errorf("invalid action %q", action.action)
 	}
 	return args, nil
+}
+
+// Requests without a limit keep the helper pod spec they had before.
+func appendLimitArg(args []string, limit int64) []string {
+	if limit <= 0 {
+		return args
+	}
+	return append(args, "--lvlimit", strconv.FormatInt(limit, 10))
 }
 
 func runHelper(
@@ -215,12 +251,12 @@ func runHelper(
 	pods corev1.PodInterface,
 	pod *v1.Pod,
 	params helperParams,
-) error {
+) (string, error) {
 	if err := ensureHelper(ctx, pods, pod, params.config.MaxActive); err != nil {
-		return err
+		return "", err
 	}
 
-	terminal, err := waitForHelper(
+	terminal, message, err := waitForHelper(
 		ctx,
 		pods,
 		pod.Name,
@@ -233,11 +269,11 @@ func runHelper(
 			pod.Name,
 			err,
 		)
-		return err
+		return "", err
 	}
 
 	deleteHelper(pods, pod.Name)
-	return err
+	return message, err
 }
 
 func ensureHelper(
@@ -475,10 +511,10 @@ func waitForHelper(
 	pods corev1.PodInterface,
 	podName, resource string,
 	action actionType,
-) (bool, error) {
+) (bool, string, error) {
 	for {
 		pod, readErr := pods.Get(ctx, podName, metav1.GetOptions{})
-		terminal, resultErr := helperResult(
+		terminal, message, resultErr := helperResult(
 			ctx,
 			pod,
 			readErr,
@@ -487,10 +523,10 @@ func waitForHelper(
 			action,
 		)
 		if terminal || resultErr != nil {
-			return terminal, resultErr
+			return terminal, message, resultErr
 		}
 		if err := waitForRetry(ctx); err != nil {
-			return false, err
+			return false, "", err
 		}
 	}
 }
@@ -501,13 +537,13 @@ func helperResult(
 	readErr error,
 	podName, resource string,
 	action actionType,
-) (bool, error) {
+) (bool, string, error) {
 	if readErr != nil {
 		if ctx.Err() != nil {
-			return false, status.FromContextError(ctx.Err()).Err()
+			return false, "", status.FromContextError(ctx.Err()).Err()
 		}
 		if k8serror.IsNotFound(readErr) {
-			return false, status.Errorf(
+			return false, "", status.Errorf(
 				codes.Unavailable,
 				"%s %s helper pod %q disappeared; retry",
 				resource,
@@ -516,27 +552,37 @@ func helperResult(
 			)
 		}
 		klog.Errorf("error reading helper pod: %v", readErr)
-		return false, nil
+		return false, "", nil
 	}
 	if pod == nil {
-		return false, status.Error(codes.Internal, "Kubernetes API returned an empty helper pod")
+		return false, "", status.Error(codes.Internal, "Kubernetes API returned an empty helper pod")
 	}
 
 	switch pod.Status.Phase {
 	case v1.PodFailed:
 		klog.Infof("helper pod %s terminated with failure", pod.Name)
-		return true, helperFailure(pod, resource, action)
+		return true, "", helperFailure(pod, resource, action)
 	case v1.PodSucceeded:
 		klog.Infof("helper pod %s terminated successfully", pod.Name)
-		return true, nil
+		return true, terminationMessage(pod), nil
 	default:
 		klog.Infof("helper pod %s status: %s", pod.Name, pod.Status.Phase)
-		return false, nil
+		return false, "", nil
 	}
+}
+
+func terminationMessage(pod *v1.Pod) string {
+	for _, status := range pod.Status.ContainerStatuses {
+		if terminated := status.State.Terminated; terminated != nil {
+			return terminated.Message
+		}
+	}
+	return ""
 }
 
 func helperFailure(pod *v1.Pod, resource string, action actionType) error {
 	details := make([]string, 0, len(pod.Status.ContainerStatuses)+1)
+	outOfRange := false
 	if pod.Status.Reason != "" || pod.Status.Message != "" {
 		details = append(details, fmt.Sprintf(
 			"pod reason=%s message=%s",
@@ -549,6 +595,7 @@ func helperFailure(pod *v1.Pod, resource string, action actionType) error {
 		if terminated == nil {
 			continue
 		}
+		outOfRange = outOfRange || terminated.ExitCode == HelperExitCodeOutOfRange
 		detail := fmt.Sprintf(
 			"container %s exited with code %d reason=%s",
 			status.Name,
@@ -564,6 +611,9 @@ func helperFailure(pod *v1.Pod, resource string, action actionType) error {
 	message := fmt.Sprintf("%s %s helper pod %s failed", resource, action, pod.Name)
 	if len(details) > 0 {
 		message += ": " + strings.Join(details, "; ")
+	}
+	if outOfRange {
+		return status.Error(codes.OutOfRange, message)
 	}
 	return status.Error(codes.Internal, message)
 }
@@ -692,7 +742,7 @@ func newHelperContainer(
 		Command:                  []string{"csi-lvmplugin-provisioner"},
 		Args:                     commandArgs,
 		VolumeMounts:             helperMounts(),
-		TerminationMessagePath:   "/termination.log",
+		TerminationMessagePath:   HelperTerminationMessagePath,
 		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
 		ImagePullPolicy:          params.pullPolicy,
 		SecurityContext: &v1.SecurityContext{

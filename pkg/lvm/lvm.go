@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -69,6 +70,7 @@ type volumeAction struct {
 	name             string
 	nodeName         string
 	size             int64
+	limit            int64
 	lvmType          string
 	provisionerImage string
 	pullPolicy       v1.PullPolicy
@@ -644,7 +646,7 @@ func activateVolumeGroups(vgNames ...string) error {
 }
 
 // CreateLVS creates the new volume, used by lvcreate provisioner pod
-func CreateLVS(vg string, name string, size uint64, lvmType string) (string, error) {
+func CreateLVS(vg string, name string, size, limit uint64, lvmType string) (string, error) {
 	if size == 0 {
 		return "", fmt.Errorf("size must be greater than 0")
 	}
@@ -659,6 +661,15 @@ func CreateLVS(vg string, name string, size uint64, lvmType string) (string, err
 	if found {
 		if err := validateExistingVolume(existing, size, lvmType); err != nil {
 			return "", err
+		}
+		if lvmType == DmThinType {
+			actualSize, err := parseLogicalVolumeSize(existing)
+			if err != nil {
+				return "", err
+			}
+			if err := checkSizeLimit(actualSize, limit); err != nil {
+				return "", err
+			}
 		}
 		klog.Infof("logical volume %s/%s already exists and is compatible", vg, name)
 		return name, nil
@@ -679,6 +690,20 @@ func CreateLVS(vg string, name string, size uint64, lvmType string) (string, err
 
 	if pvs < 2 && lvmType == StripedType {
 		klog.Warning("pvcount is <2, the striped does not meaningful.")
+	}
+
+	if lvmType == DmThinType {
+		extentSize, err := vgExtentSize(executor, vg)
+		if err != nil {
+			return "", err
+		}
+		allocated, err := allocatedSize(size, extentSize)
+		if err != nil {
+			return "", err
+		}
+		if err := checkSizeLimit(allocated, limit); err != nil {
+			return "", err
+		}
 	}
 
 	switch lvmType {
@@ -942,42 +967,156 @@ func parseLogicalVolumeSize(volume logicalVolume) (uint64, error) {
 	return size, nil
 }
 
-func extendLVS(name string, size uint64, isBlock bool, volumePath string) (string, error) {
+func findLogicalVolume(vgName, lvName string) (logicalVolume, error) {
+	volume, found, err := getLogicalVolume(vgName, lvName)
+	if err != nil {
+		return logicalVolume{}, fmt.Errorf("unable to get logical volume %q/%q: %w", vgName, lvName, err)
+	}
+	if !found {
+		return logicalVolume{}, fmt.Errorf("logical volume %q/%q does not exist", vgName, lvName)
+	}
+	return volume, nil
+}
+
+// LogicalVolumeSize returns the lv_size LVM reports.
+func LogicalVolumeSize(vgName, lvName string) (uint64, error) {
+	volume, err := findLogicalVolume(vgName, lvName)
+	if err != nil {
+		return 0, err
+	}
+	return parseLogicalVolumeSize(volume)
+}
+
+// lvcreate and lvextend round dm-thin volumes up to whole extents. The result
+// fits in an int64, the CSI capacity type.
+func allocatedSize(size, extentSize uint64) (uint64, error) {
+	if extentSize == 0 {
+		return 0, fmt.Errorf("invalid extent size 0")
+	}
+	extents := size / extentSize
+	if size%extentSize != 0 {
+		extents++
+	}
+	if extents > math.MaxInt64/extentSize {
+		return 0, fmt.Errorf("%w: size %d overflows when rounded up to %d bytes", ErrOutOfRange, size, extentSize)
+	}
+	return extents * extentSize, nil
+}
+
+func checkSizeLimit(size, limit uint64) error {
+	if limit > 0 && size > limit {
+		return fmt.Errorf("%w: allocated size %d exceeds limit bytes %d", ErrOutOfRange, size, limit)
+	}
+	return nil
+}
+
+func extendLVS(name string, size, limit uint64, isBlock bool, volumePath string) (uint64, string, error) {
 	volume, err := getLogicalVolumeByName(name)
 	if err != nil {
-		return "", fmt.Errorf("unable to get logical volume %q: %w", name, err)
+		return 0, "", fmt.Errorf("unable to get logical volume %q: %w", name, err)
 	}
 
 	executor := newCommandExecutor()
-	lvOutput, err := ensureLogicalVolumeSize(executor, volume, size)
+	lvSize, lvOutput, err := ensureLogicalVolumeSize(executor, volume, size, limit)
 	if err != nil {
-		return lvOutput, err
+		return 0, lvOutput, err
 	}
 	if isBlock {
-		return lvOutput, nil
+		return lvSize, lvOutput, nil
 	}
 
 	fsOutput, err := resizeFilesystem(executor, volume, volumePath)
-	return combineCommandOutput(lvOutput, fsOutput), err
+	return lvSize, combineCommandOutput(lvOutput, fsOutput), err
 }
 
-func ensureLogicalVolumeSize(executor commandExecutor, volume logicalVolume, size uint64) (string, error) {
+func ensureLogicalVolumeSize(executor commandExecutor, volume logicalVolume, size, limit uint64) (uint64, string, error) {
 	lvSize, err := parseLogicalVolumeSize(volume)
 	if err != nil {
-		return "", err
+		return 0, "", err
+	}
+	if volume.SegType == ThinVolType {
+		planned, err := plannedSize(executor, volume, lvSize, size)
+		if err != nil {
+			return 0, "", err
+		}
+		if err := checkSizeLimit(planned, limit); err != nil {
+			return 0, "", err
+		}
 	}
 	if lvSize >= size {
 		klog.Infof("logical volume %s already has size %d, satisfying requested size %d", volume.Name, lvSize, size)
-		return "", nil
+		return lvSize, "", nil
 	}
 
 	args := buildLVExtendArgs(volume.VGName, volume.Name, size)
 	klog.Infof("lvextend %s", args)
 	output, err := executor.Execute("lvextend", args)
 	if err != nil {
-		return output, fmt.Errorf("unable to extend logical volume %q/%q: %w", volume.VGName, volume.Name, err)
+		return 0, output, fmt.Errorf("unable to extend logical volume %q/%q: %w", volume.VGName, volume.Name, err)
 	}
-	return output, nil
+	newSize, err := LogicalVolumeSize(volume.VGName, volume.Name)
+	if err != nil {
+		return 0, output, err
+	}
+	return newSize, output, nil
+}
+
+// lvextend rounds the growth of a dm-thin volume up to whole extents.
+func plannedSize(executor commandExecutor, volume logicalVolume, lvSize, size uint64) (uint64, error) {
+	if lvSize >= size {
+		return lvSize, nil
+	}
+	extentSize, err := vgExtentSize(executor, volume.VGName)
+	if err != nil {
+		return 0, err
+	}
+	growth, err := allocatedSize(size-lvSize, extentSize)
+	if err != nil {
+		return 0, err
+	}
+	if growth > math.MaxInt64-lvSize {
+		return 0, fmt.Errorf("%w: size %d plus growth %d overflows", ErrOutOfRange, lvSize, growth)
+	}
+	return lvSize + growth, nil
+}
+
+// CheckThinCloneSize checks a dm-thin clone of srcName grown to size against limit.
+func CheckThinCloneSize(vgName, srcName string, size, limit uint64) error {
+	volume, err := findLogicalVolume(vgName, srcName)
+	if err != nil {
+		return err
+	}
+	lvSize, err := parseLogicalVolumeSize(volume)
+	if err != nil {
+		return err
+	}
+	planned, err := plannedSize(newCommandExecutor(), volume, lvSize, size)
+	if err != nil {
+		return err
+	}
+	return checkSizeLimit(planned, limit)
+}
+
+// ExtendLogicalVolume grows the LV to at least size bytes.
+func ExtendLogicalVolume(vgName, lvName string, size, limit uint64) (string, error) {
+	volume, err := findLogicalVolume(vgName, lvName)
+	if err != nil {
+		return "", err
+	}
+	_, output, err := ensureLogicalVolumeSize(newCommandExecutor(), volume, size, limit)
+	return output, err
+}
+
+func vgExtentSize(executor commandExecutor, vgName string) (uint64, error) {
+	out, err := executor.Execute("vgs", []string{vgName, "--noheadings", "--units", "b", "--nosuffix", "-o", "vg_extent_size"})
+	if err != nil {
+		return 0, fmt.Errorf("unable to get extent size of vg %q: %w", vgName, err)
+	}
+	extentSize, err := strconv.ParseUint(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unable to parse extent size %q of vg %q: %w", strings.TrimSpace(out), vgName, err)
+	}
+	return extentSize, nil
 }
 
 func resizeFilesystem(executor commandExecutor, volume logicalVolume, volumePath string) (string, error) {

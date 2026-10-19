@@ -1,10 +1,13 @@
 package lvm
 
 import (
+	"math"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -155,6 +158,7 @@ func TestValidateCapacityRange(t *testing.T) {
 		capacityRange *csi.CapacityRange
 		want          int64
 		wantErr       bool
+		wantCode      codes.Code
 	}{
 		{name: "nil range", wantErr: true},
 		{
@@ -172,6 +176,45 @@ func TestValidateCapacityRange(t *testing.T) {
 			capacityRange: &csi.CapacityRange{RequiredBytes: 1048576},
 			want:          1048576,
 		},
+		{
+			name:          "unaligned required bytes are rounded up",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 8829681009},
+			want:          8829681152,
+		},
+		{
+			name:          "rounded size within limit",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 1000, LimitBytes: 1024},
+			want:          1024,
+		},
+		{
+			name:          "rounded size exceeds limit",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 1000, LimitBytes: 1000},
+			wantErr:       true,
+			wantCode:      codes.OutOfRange,
+		},
+		{
+			name:          "negative limit",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 1024, LimitBytes: -1},
+			wantErr:       true,
+			wantCode:      codes.InvalidArgument,
+		},
+		{
+			name:          "required bytes exceed limit",
+			capacityRange: &csi.CapacityRange{RequiredBytes: 2048, LimitBytes: 1024},
+			wantErr:       true,
+			wantCode:      codes.InvalidArgument,
+		},
+		{
+			name:          "rounding overflows",
+			capacityRange: &csi.CapacityRange{RequiredBytes: math.MaxInt64},
+			wantErr:       true,
+			wantCode:      codes.OutOfRange,
+		},
+		{
+			name:          "largest aligned size",
+			capacityRange: &csi.CapacityRange{RequiredBytes: math.MaxInt64 - 511},
+			want:          math.MaxInt64 - 511,
+		},
 	}
 
 	for _, tt := range tests {
@@ -180,6 +223,11 @@ func TestValidateCapacityRange(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected validation error, got %d", got)
+				}
+				if tt.wantCode != codes.OK {
+					if code := status.Code(capacityError(err)); code != tt.wantCode {
+						t.Fatalf("expected %v, got %v for %v", tt.wantCode, code, err)
+					}
 				}
 				return
 			}

@@ -18,6 +18,7 @@ package lvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -230,7 +231,7 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 	klog.Infof("NodeExpandVolume: %s", req)
 	volID, volPath, capacity, err := validateNodeExpandRequest(req)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, capacityError(err)
 	}
 
 	isBlock, err := isBlockVolumePath(volPath)
@@ -238,13 +239,17 @@ func (ns *nodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	output, err := extendLVS(volID, uint64(capacity), isBlock, volPath) //nolint:gosec
+	limit := req.GetCapacityRange().GetLimitBytes()
+	size, output, err := extendLVS(volID, uint64(capacity), uint64(limit), isBlock, volPath) //nolint:gosec
+	if errors.Is(err, ErrOutOfRange) {
+		return nil, status.Errorf(codes.OutOfRange, "unable to expand volume %q: %v", volID, err)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to expand volume %q: %v output: %s", volID, err, output)
 	}
 
 	return &csi.NodeExpandVolumeResponse{
-		CapacityBytes: capacity,
+		CapacityBytes: int64(size), //nolint:gosec // allocatedSize keeps sizes within int64
 	}, nil
 }
 
