@@ -17,6 +17,7 @@ limitations under the License.
 package lvm
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"time"
@@ -24,7 +25,6 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapclient "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
